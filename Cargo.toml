@@ -1,0 +1,17 @@
+[package]
+name = "fastsigner"
+version = "0.1.0"
+edition = "2021"
+description = "Fast native APK signer (APK Signature Scheme v2 + v3)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# SHA-256/512 (BoringSSL asm with SHA-NI), RSA PKCS#1 v1.5, ECDSA P-256, PKCS#8 parsing, RNG.
+ring = "0.17"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false

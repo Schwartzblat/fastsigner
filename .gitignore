@@ -1,0 +1,12 @@
+/target
+/testdata/*.apk
+/testdata/*.idsig
+/testdata/*.pem
+/testdata/*.pk8
+/testdata/*.jks
+
+# OS / editor cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/
