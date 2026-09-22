@@ -587,9 +587,83 @@ Thread scaling on `big.apk`, digest phase, best of 5: 1 → 59.4 ms, 4 → 15.7,
   Small APKs are latency-bound, so this is where batch mode pays; big ones are throughput-bound and
   gain little. `--out` is single-input, `--out-dir` maps by file name, in place is the default.
 
-### 10.5 Open items (in the order worth doing)
+### 10.5 zipalign (2026-09-22)
+
+- **The check is free.** Alignment needs every stored entry's local-header lengths, i.e. ~15k
+  30-byte reads spread over 145 MB — 10+ ms of `pread`s or a new `mmap` dependency if done
+  separately. Instead the digest workers hand each 1 MiB chunk to an inspector that binary-
+  searches the sorted header offsets and parses the headers inside the chunk (headers straddling
+  a chunk boundary are re-read afterwards; there are at most a handful). Measured fast-path cost:
+  +0.1–0.6 ms across tiny…big. Every APK in the local corpus is already aligned (16 KiB `.so`
+  in WhatsApp), so this is the path that runs in practice.
+- **Rewrite = apksig, byte for byte.** apksigner already re-aligns when it rewrites an APK, so
+  its output is the oracle for ours. Mirroring `ApkSigner.sign` step 3 exactly — `0xd935`
+  alignment field per stored entry (`createExtraFieldToAlignData`, dropping old `0xd935`
+  fields and zipalign's `id=0,size=0` zero padding), directory entries and v1 files dropped,
+  `stamp-cert-sha256` / `pinlist.meta` left as unprocessed bytes, unprocessed gaps *and the
+  bytes after the last record* copied verbatim — makes fastsigner's output identical to
+  apksigner's on all 100 local corpus APKs rebuilt unaligned with Python's `zipfile`
+  (`tests/corpus_identity.sh`; 8 tiny language splits came out aligned by chance and were
+  forced through the rewrite with `--zipalign always`, which is apksigner's default behaviour). Two quirks had to be copied to get there: apksig keeps the
+  orphaned local record of a dropped source-stamp entry, and copies whatever trails the last
+  record. Directory entries are now dropped on the fast path too, so both paths produce
+  apksigner's entry set.
+- **Rule differences, on purpose:** the *check* uses zipalign's rule (4 / page size by
+  extension) so `zipalign -c -P 16 4` passes; the *rewrite* uses
+  `max(rule, declared 0xd935 alignment)` where apksig uses the declared value alone. A `.so`
+  declared 4096 is therefore re-aligned to 16 KiB by us and kept at 4096 by apksigner.
+- **ext4 replace-via-rename costs 30 ms.** Writing the rewritten APK to a temp file and
+  `rename()`-ing it over the original triggers `auto_da_alloc`, which flushes the new file's
+  delayed-allocation blocks: 28.6 ms for 145 MB, ~10 ms floor even for 3 MB.
+  `renameat2(RENAME_EXCHANGE)` + unlink is 3.2 ms and still atomic. glibc exports it, no crate.
+- **Rewrite-path cost:** unaligned small 3.4 ms, unaligned big 34 ms in place (parallel copy
+  ~18 ms + second digest 6 ms), vs ~600 ms for `zipalign` + `apksigner`. A patch → sign loop
+  that rebuilds the ZIP with an unaligned writer lands here every time, so it matters.
+  Improved to **1.9 ms / 28 ms** the next day, see §10.6.
+
+### 10.6 Digest-during-rewrite, and what the kernel allows (2026-09-22)
+
+Goal: fold the second digest pass (6 ms on big) into the rewrite copy. The output offsets are
+known before any byte is copied, so a worker can materialise output chunk *k* = `[k MiB,
+(k+1) MiB)` from the plan, write it, and hash it — the output chunks are exactly the v2/v3
+digest chunks. Straightforward; the surprises were all in the write path.
+
+| variant (big, unaligned, in place) | rewrite+digest | why |
+|---|---:|---|
+| before: group copy, then re-read + digest | 26 ms | 20 ms copy + 6 ms digest |
+| fused, 16 threads, dynamic chunks | 29–32 ms | slower! |
+| fused, static per-thread ranges + pre-sized file | 29–35 ms | no help |
+| fused, output via `mmap(MAP_SHARED)` + `MADV_POPULATE_WRITE` | 34–38 ms | worse |
+| fused, userspace mutex around `pwrite` | 29–32 ms | writer slowed by 15 competing threads |
+| **fused, 1 writer thread + 6 producers over a channel** | **~26 ms** (total 28) | writer-bound |
+
+What the per-phase counters showed (`--timing` prints them, thread-summed):
+- **ext4 serialises buffered writes to one inode** (`i_rwsem`). One thread writes 145 MB into a
+  fresh file in 15.6 ms; 16 threads spend 250–340 ms *combined* in `pwrite` — all but one are
+  waiting, and kernel rwsem waiters *spin*, stealing the CPU the hashing needs. That is why the
+  fused pass lost to the old two-pass version.
+- **mmap does not escape it**: page-cache population through write faults (`page_mkwrite`, block
+  reservation per page) serialises just the same, 300+ ms thread-summed.
+- A userspace mutex makes waiters sleep, but the in-lock write time itself grows from 16.5 ms
+  (2 threads) to 27 ms (16 threads): memory contention from the other threads slows the single
+  writer. Fewer, busier threads are better here — the opposite of the digest engine.
+- **Dedicated writer + few producers** is the design that fits: the writer streams at its
+  ~7 GB/s limit undisturbed (20–23 ms for 145 MB, independent of 3–6 producers), producers
+  (read window + assemble + hash ≈ 0.6 ms per chunk) hide behind it. Buffers travel over
+  channels, two per producer, so nothing is ever copied twice.
+- **Do not digest what you are about to throw away.** In the check path the input was digested
+  (6 ms) only to discover it was misaligned. A 16-entry header sample (≤16 `pread`s, ~30 µs)
+  proves misalignment for any ZIP written without padding and lets the rewrite start at once.
+  A sample that passes falls back to the full inspector-on-digest check, so nothing is lost.
+
+Net: unaligned big 33.6 → **27.5 ms** in place, unaligned small 3.4 → **1.9 ms**; fast path and
+byte identity with apksigner unchanged (100/100 corpus). The remaining 21 ms on big is the
+kernel's page-cache write; only larger folios in ext4 or a different filesystem move it.
+
+### 10.7 Open items (in the order worth doing)
 
 1. Install a fastsigner-signed, v2+v3-only, minSdk<24 APK on the API 36 AVD (§6.1 open test).
 2. PKCS#12 keystores (Android Studio debug keystores on modern JDKs) — needs an AES-CBC crate.
-3. Per-chunk digest cache for the patch → re-sign loop (§8) — 5.6 ms → sub-millisecond on big.
+3. Per-chunk digest cache for the patch → re-sign loop (§8) — 5.6 ms → sub-millisecond on big
+   (fast path only; the rewrite path is write-bound, see §10.6).
 4. v3.1 / lineage if rotation is ever needed; Zip64; v4 `.idsig` for `adb install --incremental`.

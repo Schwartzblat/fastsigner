@@ -8,6 +8,11 @@ pub const SIG_BLOCK_MAGIC: &[u8; 16] = b"APK Sig Block 42";
 const EOCD_SIG: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
 const ZIP64_LOCATOR_SIG: [u8; 4] = [0x50, 0x4b, 0x06, 0x07];
 const CD_ENTRY_SIG: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+pub const LFH_SIG: [u8; 4] = [0x50, 0x4b, 0x03, 0x04];
+pub const LFH_LEN: usize = 30;
+pub const DATA_DESCRIPTOR_SIG: u32 = 0x0807_4b50;
+pub const METHOD_STORED: u16 = 0;
+pub const FLAG_DATA_DESCRIPTOR: u16 = 1 << 3;
 const EOCD_MIN_LEN: usize = 22;
 const MAX_COMMENT_LEN: usize = 0xffff;
 
@@ -155,8 +160,8 @@ pub fn set_eocd_entry_count(eocd: &mut [u8], n: u16) {
     eocd[10..12].copy_from_slice(&n.to_le_bytes());
 }
 
-/// Mirrors apksig's `V1SchemeSigner.isJarEntryDigestNeededInManifest == false` for files:
-/// signature-related entries directly under `META-INF/` (case-insensitive file name).
+/// v1 (JAR) signature files directly under `META-INF/`, case-insensitive file name (apksig's
+/// `isJarEntryDigestNeededInManifest == false` for non-directories).
 pub fn is_v1_signature_entry(name: &[u8]) -> bool {
     let Some(rest) = name.strip_prefix(b"META-INF/") else { return false };
     if rest.contains(&b'/') {
@@ -171,19 +176,34 @@ pub fn is_v1_signature_entry(name: &[u8]) -> bool {
         || lower.starts_with(b"sig-")
 }
 
-pub struct FilteredCd {
-    pub bytes: Vec<u8>,
-    pub entries: u64,
-    pub removed: Vec<String>,
+/// One Central Directory record, referenced by byte ranges into the CD buffer.
+#[derive(Debug, Clone)]
+pub struct CdEntry {
+    pub record: std::ops::Range<usize>,
+    pub name: std::ops::Range<usize>,
+    pub lfh_off: u64,
+    pub method: u16,
+    pub flags: u16,
+    pub compressed_size: u64,
 }
 
-/// Walk the Central Directory and drop v1 (JAR) signature entries, like apksigner does even
-/// when v1 signing is disabled. The local file data of dropped entries is left in place
-/// (orphaned) — readers only follow the Central Directory.
-pub fn strip_v1_signature_entries(cd: &[u8]) -> Result<FilteredCd, String> {
-    let mut out = Vec::with_capacity(cd.len());
-    let mut removed = Vec::new();
-    let mut entries = 0u64;
+impl CdEntry {
+    pub fn name<'a>(&self, cd: &'a [u8]) -> &'a [u8] {
+        &cd[self.name.clone()]
+    }
+    pub fn is_dir(&self, cd: &[u8]) -> bool {
+        self.name(cd).ends_with(b"/")
+    }
+    pub fn is_stored(&self) -> bool {
+        self.method == METHOD_STORED
+    }
+    pub fn has_data_descriptor(&self) -> bool {
+        self.flags & FLAG_DATA_DESCRIPTOR != 0
+    }
+}
+
+pub fn parse_cd_entries(cd: &[u8]) -> Result<Vec<CdEntry>, String> {
+    let mut out = Vec::new();
     let mut p = 0usize;
     while p < cd.len() {
         if p + 46 > cd.len() || cd[p..p + 4] != CD_ENTRY_SIG {
@@ -196,16 +216,85 @@ pub fn strip_v1_signature_entries(cd: &[u8]) -> Result<FilteredCd, String> {
         if p + total > cd.len() {
             return Err(format!("Central Directory entry at offset {p} overruns the directory"));
         }
-        let name = &cd[p + 46..p + 46 + name_len];
-        if is_v1_signature_entry(name) {
-            removed.push(String::from_utf8_lossy(name).into_owned());
-        } else {
-            out.extend_from_slice(&cd[p..p + total]);
-            entries += 1;
-        }
+        out.push(CdEntry {
+            record: p..p + total,
+            name: p + 46..p + 46 + name_len,
+            lfh_off: u32le(cd, p + 42) as u64,
+            method: u16le(cd, p + 10),
+            flags: u16le(cd, p + 8),
+            compressed_size: u32le(cd, p + 20) as u64,
+        });
         p += total;
     }
-    Ok(FilteredCd { bytes: out, entries, removed })
+    Ok(out)
+}
+
+/// zipalign's rule: uncompressed non-directory entries need 4-byte aligned data, and `.so`
+/// files a page (`lib_page_size` bytes, 0 disables). Returns 1 when no alignment applies.
+pub fn required_alignment(cd: &[u8], e: &CdEntry, lib_page_size: u32) -> u32 {
+    if !e.is_stored() || e.is_dir(cd) {
+        return 1;
+    }
+    if lib_page_size > 4 && e.name(cd).ends_with(b".so") {
+        lib_page_size
+    } else {
+        4
+    }
+}
+
+/// What apksigner does with an input entry when re-signing (`ApkSigner.sign`, step 3):
+/// `Output` is copied (re-aligned if stored), `Skip` is dropped (v1 signature files and
+/// directory entries), `Gap` is dropped from the Central Directory but its local record is left
+/// where it was, as unprocessed bytes (the source stamp hash and the pin list, which apksig
+/// regenerates rather than copies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryPolicy {
+    Output,
+    Skip,
+    Gap,
+}
+
+pub fn entry_policy(name: &[u8]) -> EntryPolicy {
+    if name == b"stamp-cert-sha256" || name == b"pinlist.meta" {
+        EntryPolicy::Gap
+    } else if name.ends_with(b"/") || is_v1_signature_entry(name) {
+        EntryPolicy::Skip
+    } else {
+        EntryPolicy::Output
+    }
+}
+
+pub struct FilteredCd {
+    /// Central Directory holding only `Output` entries.
+    pub bytes: Vec<u8>,
+    pub entries: u64,
+    pub removed: Vec<String>,
+    /// Every record of the original Central Directory, with its policy.
+    pub all: Vec<CdEntry>,
+    pub policies: Vec<EntryPolicy>,
+}
+
+/// Apply `entry_policy` to a Central Directory. The local file data of dropped entries is
+/// left in place (orphaned) unless the entries section is rewritten for alignment — readers
+/// only follow the Central Directory, and apksigner leaves such orphans too.
+pub fn filter_cd(cd: &[u8]) -> Result<FilteredCd, String> {
+    let all = parse_cd_entries(cd)?;
+    let mut out = Vec::with_capacity(cd.len());
+    let mut removed = Vec::new();
+    let mut entries = 0u64;
+    let mut policies = Vec::with_capacity(all.len());
+    for e in &all {
+        let name = e.name(cd);
+        let policy = entry_policy(name);
+        policies.push(policy);
+        if policy == EntryPolicy::Output {
+            out.extend_from_slice(&cd[e.record.clone()]);
+            entries += 1;
+        } else {
+            removed.push(String::from_utf8_lossy(name).into_owned());
+        }
+    }
+    Ok(FilteredCd { bytes: out, entries, removed, all, policies })
 }
 
 #[cfg(test)]
@@ -317,6 +406,13 @@ pub(crate) mod tests {
         assert!(is_v1_signature_entry(b"META-INF/KEY.DSA"));
         assert!(is_v1_signature_entry(b"META-INF/KEY.EC"));
         assert!(is_v1_signature_entry(b"META-INF/SIG-FOO"));
+        assert!(!is_v1_signature_entry(b"stamp-cert-sha256"));
+        assert_eq!(entry_policy(b"stamp-cert-sha256"), EntryPolicy::Gap);
+        assert_eq!(entry_policy(b"pinlist.meta"), EntryPolicy::Gap);
+        assert_eq!(entry_policy(b"META-INF/stamp-cert-sha256"), EntryPolicy::Output);
+        assert_eq!(entry_policy(b"assets/"), EntryPolicy::Skip);
+        assert_eq!(entry_policy(b"META-INF/CERT.RSA"), EntryPolicy::Skip);
+        assert_eq!(entry_policy(b"classes.dex"), EntryPolicy::Output);
         assert!(!is_v1_signature_entry(b"META-INF/services/x"));
         assert!(!is_v1_signature_entry(b"META-INF/com/android/build/gradle/app-metadata.properties"));
         assert!(!is_v1_signature_entry(b"META-INF/version-control-info.textproto"));
@@ -325,15 +421,40 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn strips_v1_entries_from_cd() {
-        let z = synth_zip(&["classes.dex", "META-INF/MANIFEST.MF", "META-INF/CERT.SF", "META-INF/CERT.RSA", "res/x"], None, b"");
+    fn cd_entries_and_alignment_rule() {
+        let z = synth_zip(&["classes.dex", "lib/arm64-v8a/libx.so", "assets/", "res/a.png"], None, b"");
         let s = parse(z.as_slice()).unwrap();
         let cd = &z[s.cd_off as usize..(s.cd_off + s.cd_size) as usize];
-        let f = strip_v1_signature_entries(cd).unwrap();
+        let es = parse_cd_entries(cd).unwrap();
+        assert_eq!(es.len(), 4);
+        assert_eq!(es[0].name(cd), b"classes.dex");
+        assert!(es[0].is_stored() && !es[0].has_data_descriptor());
+        assert_eq!(es[0].lfh_off, 0);
+        assert!(es[1].lfh_off > 0);
+        assert!(es[2].is_dir(cd));
+        assert_eq!(required_alignment(cd, &es[0], 16384), 4);
+        assert_eq!(required_alignment(cd, &es[1], 16384), 16384);
+        assert_eq!(required_alignment(cd, &es[1], 4096), 4096);
+        assert_eq!(required_alignment(cd, &es[1], 0), 4);
+        assert_eq!(required_alignment(cd, &es[2], 16384), 1, "directories are never aligned");
+        let mut compressed = es[3].clone();
+        compressed.method = 8;
+        assert_eq!(required_alignment(cd, &compressed, 16384), 1);
+        assert!(parse_cd_entries(&cd[..cd.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn filters_cd_like_apksigner() {
+        let z = synth_zip(&["classes.dex", "META-INF/MANIFEST.MF", "META-INF/CERT.SF", "META-INF/CERT.RSA", "res/", "stamp-cert-sha256", "res/x"], None, b"");
+        let s = parse(z.as_slice()).unwrap();
+        let cd = &z[s.cd_off as usize..(s.cd_off + s.cd_size) as usize];
+        let f = filter_cd(cd).unwrap();
         assert_eq!(f.entries, 2);
-        assert_eq!(f.removed, vec!["META-INF/MANIFEST.MF", "META-INF/CERT.SF", "META-INF/CERT.RSA"]);
+        assert_eq!(f.removed, vec!["META-INF/MANIFEST.MF", "META-INF/CERT.SF", "META-INF/CERT.RSA", "res/", "stamp-cert-sha256"]);
+        assert_eq!(f.all.len(), 7);
+        assert_eq!(f.policies, [EntryPolicy::Output, EntryPolicy::Skip, EntryPolicy::Skip, EntryPolicy::Skip, EntryPolicy::Skip, EntryPolicy::Gap, EntryPolicy::Output]);
         // The filtered CD must itself parse cleanly and keep the survivors in order.
-        let g = strip_v1_signature_entries(&f.bytes).unwrap();
+        let g = filter_cd(&f.bytes).unwrap();
         assert_eq!(g.entries, 2);
         assert!(g.removed.is_empty());
         assert_eq!(g.bytes, f.bytes);

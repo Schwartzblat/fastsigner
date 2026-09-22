@@ -56,13 +56,53 @@ impl<'a> Source<'a> {
     }
 }
 
+/// Digest of one chunk: `H(0xa5 || u32le(len) || parts...)`.
+pub fn hash_chunk(alg: &'static Algorithm, parts: &[&[u8]]) -> ring::digest::Digest {
+    let len: usize = parts.iter().map(|p| p.len()).sum();
+    let mut ctx = Context::new(alg);
+    let mut prefix = [0xa5u8, 0, 0, 0, 0];
+    prefix[1..].copy_from_slice(&(len as u32).to_le_bytes());
+    ctx.update(&prefix);
+    for p in parts {
+        ctx.update(p);
+    }
+    ctx.finish()
+}
+
+/// Chunk digests of an in-memory section, concatenated, plus the chunk count.
+pub fn chunk_digests_of(alg: &'static Algorithm, data: &[u8]) -> (usize, Vec<u8>) {
+    let mut out = Vec::with_capacity(((data.len() >> 20) + 1) * alg.output_len());
+    let mut n = 0;
+    for c in data.chunks(CHUNK_SIZE as usize) {
+        out.extend_from_slice(hash_chunk(alg, &[c]).as_ref());
+        n += 1;
+    }
+    (n, out)
+}
+
+/// Top-level digest: `H(0x5a || u32le(count) || chunk digests)`. `parts` are concatenated
+/// chunk-digest runs (e.g. entries section, central directory, EOCD).
+pub fn top_digest(alg: &'static Algorithm, count: usize, parts: &[&[u8]]) -> Vec<u8> {
+    let mut ctx = Context::new(alg);
+    let mut prefix = [0x5au8, 0, 0, 0, 0];
+    prefix[1..].copy_from_slice(&(count as u32).to_le_bytes());
+    ctx.update(&prefix);
+    for p in parts {
+        ctx.update(p);
+    }
+    ctx.finish().as_ref().to_vec()
+}
+
 /// Compute the content digest for every algorithm in `algs`, in one pass over the data.
-/// Returns one digest per algorithm, in order.
+/// Returns one digest per algorithm, in order. `inspect`, if given, sees every file-backed
+/// chunk as `(file offset, bytes)` while it is in memory — used for the zipalign check so the
+/// aligned-input fast path costs no extra I/O.
 pub fn content_digests(
     file: &(impl ReadAt + Sync + ?Sized),
     sources: &[Source],
     algs: &[&'static Algorithm],
     threads: usize,
+    inspect: Option<&(dyn Fn(u64, &[u8]) + Sync)>,
 ) -> io::Result<Vec<Vec<u8>>> {
     let counts: Vec<u64> = sources.iter().map(|s| s.chunk_count()).collect();
     let total = counts.iter().sum::<u64>() as usize;
@@ -73,7 +113,6 @@ pub fn content_digests(
     // straggler (page-cache miss, SMT sibling contention) never holds a fixed slice hostage.
     let worker = |out: &mut Vec<(usize, Vec<u8>)>| -> io::Result<()> {
         let mut buf = vec![0u8; CHUNK_SIZE as usize];
-        let mut prefix = [0xa5u8, 0, 0, 0, 0];
         loop {
             let k = next.fetch_add(1, Ordering::Relaxed);
             if k >= total {
@@ -86,13 +125,17 @@ pub fn content_digests(
                 si += 1;
             }
             let n = sources[si].read_chunk(idx, file, &mut buf)?;
-            prefix[1..].copy_from_slice(&(n as u32).to_le_bytes());
+            if let Some(f) = inspect {
+                let src = &sources[si];
+                let start = idx * CHUNK_SIZE;
+                if start < src.file_len {
+                    let file_part = (src.file_len - start).min(n as u64) as usize;
+                    f(src.file_off + start, &buf[..file_part]);
+                }
+            }
             let mut d = Vec::with_capacity(per_chunk_out);
             for alg in algs {
-                let mut ctx = Context::new(alg);
-                ctx.update(&prefix);
-                ctx.update(&buf[..n]);
-                d.extend_from_slice(ctx.finish().as_ref());
+                d.extend_from_slice(hash_chunk(alg, &[&buf[..n]]).as_ref());
             }
             out.push((k, d));
         }
@@ -127,13 +170,11 @@ pub fn content_digests(
     let mut off = 0usize;
     for alg in algs {
         let ol = alg.output_len();
-        let mut concat = vec![0u8; 5 + total * ol];
-        concat[0] = 0x5a;
-        concat[1..5].copy_from_slice(&(total as u32).to_le_bytes());
+        let mut concat = vec![0u8; total * ol];
         for (k, d) in &all {
-            concat[5 + k * ol..5 + (k + 1) * ol].copy_from_slice(&d[off..off + ol]);
+            concat[k * ol..(k + 1) * ol].copy_from_slice(&d[off..off + ol]);
         }
-        result.push(ring::digest::digest(alg, &concat).as_ref().to_vec());
+        result.push(top_digest(alg, total, &[&concat]));
         off += ol;
     }
     Ok(result)
@@ -216,7 +257,7 @@ mod tests {
                 Source::bytes(&cd),
                 Source::bytes(&eocd),
             ];
-            let got = content_digests(file.as_slice(), &sources, &[&SHA256], threads).unwrap();
+            let got = content_digests(file.as_slice(), &sources, &[&SHA256], threads, None).unwrap();
             assert_eq!(got[0], expect, "threads={threads}");
         }
     }
@@ -229,7 +270,7 @@ mod tests {
         let len = 2u64 << 20;
         let sec = file[off as usize..(off + len) as usize].to_vec();
         let expect = reference(&[sec]);
-        let got = content_digests(file.as_slice(), &[Source::file(off, len, &[])], &[&SHA256], 4).unwrap();
+        let got = content_digests(file.as_slice(), &[Source::file(off, len, &[])], &[&SHA256], 4, None).unwrap();
         assert_eq!(got[0], expect);
     }
 
@@ -237,10 +278,46 @@ mod tests {
     fn two_algorithms_in_one_pass() {
         use ring::digest::SHA512;
         let data = pattern(1500, 4);
-        let got = content_digests(data.as_slice(), &[Source::bytes(&data)], &[&SHA256, &SHA512], 2).unwrap();
+        let got = content_digests(data.as_slice(), &[Source::bytes(&data)], &[&SHA256, &SHA512], 2, None).unwrap();
         assert_eq!(got[0].len(), 32);
         assert_eq!(got[1].len(), 64);
         assert_eq!(got[0], reference(&[data.clone()]));
+    }
+
+    #[test]
+    fn pieces_compose_to_the_same_digest() {
+        let a = pattern((1 << 20) + 5000, 1);
+        let b = pattern(70_000, 2);
+        let c = pattern(22, 3);
+        let whole = content_digests(a.as_slice(), &[Source::bytes(&a), Source::bytes(&b), Source::bytes(&c)], &[&SHA256], 3, None).unwrap();
+        let (na, da) = chunk_digests_of(&SHA256, &a);
+        let (nb, db) = chunk_digests_of(&SHA256, &b);
+        let (nc, dc) = chunk_digests_of(&SHA256, &c);
+        assert_eq!((na, nb, nc), (2, 1, 1));
+        assert_eq!(top_digest(&SHA256, na + nb + nc, &[&da, &db, &dc]), whole[0]);
+        // hash_chunk over split parts equals over the concatenation
+        assert_eq!(hash_chunk(&SHA256, &[&a[..100], &a[100..2000]]).as_ref(), hash_chunk(&SHA256, &[&a[..2000]]).as_ref());
+    }
+
+    #[test]
+    fn inspect_sees_every_file_byte_once_with_offsets() {
+        use std::sync::Mutex;
+        let file = pattern((2 << 20) + 777, 5);
+        let pad = vec![0u8; 3000];
+        let seen = Mutex::new(Vec::new());
+        let sources = [Source::file(100, file.len() as u64 - 100, &pad), Source::bytes(&pad)];
+        let inspect = |off: u64, b: &[u8]| seen.lock().unwrap().push((off, b.to_vec()));
+        content_digests(file.as_slice(), &sources, &[&SHA256], 3, Some(&inspect)).unwrap();
+        let mut seen = seen.into_inner().unwrap();
+        seen.sort_by_key(|(o, _)| *o);
+        let mut rebuilt = Vec::new();
+        let mut expect_off = 100u64;
+        for (off, b) in &seen {
+            assert_eq!(*off, expect_off);
+            expect_off += b.len() as u64;
+            rebuilt.extend_from_slice(b);
+        }
+        assert_eq!(rebuilt, &file[100..], "inspector must see exactly the file-backed bytes, not the padding tail");
     }
 
     #[test]

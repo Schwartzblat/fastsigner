@@ -7,6 +7,7 @@
 cd "$(dirname "$0")/../testdata" || exit 1
 FS=../target/release/fastsigner
 AS=~/Android/Sdk/build-tools/37.0.0/apksigner
+ZA=~/Android/Sdk/build-tools/37.0.0/zipalign
 fail=0
 ok()   { echo "  PASS  $*"; }
 bad()  { echo "  FAIL  $*"; fail=1; }
@@ -44,6 +45,16 @@ $FS sign --ks ec.jks --ks-pass pass:android --jobs 3 t_b?.apk && for i in 1 2 3 
 echo notazip > t_bad.apk; cp -f small.apk t_g.apk
 $FS sign --key ec.pk8 --cert ec.cert.pem t_g.apk t_bad.apk 2>/dev/null; [ $? -eq 1 ] && verify t_g.apk && ok "bad input reported, good input still signed, exit 1" || bad "partial failure handling"
 $FS sign --key ec.pk8 --cert ec.cert.pem --out t_x.apk t_g.apk t_b1.apk 2>/dev/null && bad "--out with 2 inputs refused" || ok "--out with 2 inputs refused"
+rm -rf t_out t_pw.txt
+
+echo "== zipalign =="
+zaok=1; for f in tiny small med big; do $ZA -c -P 16 4 t_${f}_rsa.apk >/dev/null 2>&1 || zaok=0; done; [ $zaok -eq 1 ] && ok "fast-path outputs pass zipalign -c -P 16 4" || bad "fast-path outputs pass zipalign -c -P 16 4"
+cp -f ua_small.apk t_ua1.apk && $FS sign --key rsa.pk8 --cert rsa.cert.pem t_ua1.apk && cmp -s ref_ua_small.apk t_ua1.apk && $ZA -c -P 16 4 t_ua1.apk >/dev/null && ok "unaligned small: rewrite identical to apksigner, zipalign -c ok" || bad "unaligned small rewrite"
+cp -f ua_big.apk t_ua2.apk && $FS sign --key rsa.pk8 --cert rsa.cert.pem t_ua2.apk && cmp -s ref_ua_big.apk t_ua2.apk && $ZA -c -P 16 4 t_ua2.apk >/dev/null && ok "unaligned big: rewrite identical to apksigner (16 KiB .so), zipalign -c ok" || bad "unaligned big rewrite"
+cp -f t_ua1.apk t_ua3.apk && $FS sign --key rsa.pk8 --cert rsa.cert.pem --timing t_ua3.apk 2>&1 | grep -q "zipalign: aligned" && cmp -s t_ua1.apk t_ua3.apk && ok "re-sign of realigned APK takes the fast path and is idempotent" || bad "idempotent re-sign"
+$FS sign --key ec.pk8 --cert ec.cert.pem --out t_ua4.apk ua_small.apk && $ZA -c 4 t_ua4.apk >/dev/null && verify t_ua4.apk && ok "unaligned --out, EC" || bad "unaligned --out"
+$FS sign --key ec.pk8 --cert ec.cert.pem --zipalign false --out t_ua5.apk ua_small.apk && ! $ZA -c 4 t_ua5.apk >/dev/null 2>&1 && verify t_ua5.apk && ok "--zipalign false leaves entries untouched (still verifies)" || bad "--zipalign false"
+$FS sign --key ec.pk8 --cert ec.cert.pem --lib-page-size 4 --out t_ua6.apk ua_big.apk && $ZA -c -p 4 t_ua6.apk >/dev/null && ! $ZA -c -P 16 4 t_ua6.apk >/dev/null 2>&1 && ok "--lib-page-size 4 gives zipalign -p alignment" || bad "--lib-page-size 4"
 rm -rf t_out t_pw.txt
 
 echo "== flags =="

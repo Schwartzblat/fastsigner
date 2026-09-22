@@ -38,5 +38,16 @@ $AS sign --key rsa.pk8 --cert rsa.cert.pem --v1-signing-enabled false --out ref_
 $AS sign --key ec.pk8 --cert ec.cert.pem --v1-signing-enabled false --out ref_small_ec.apk small.apk
 $AS sign --key rsa.pk8 --cert rsa.cert.pem --v1-signing-enabled false --v3-signing-enabled false --out ref_small_rsa_v2only.apk small.apk
 $AS sign --ks rsa.jks --ks-pass pass:android --ks-key-alias test --v1-signing-enabled false --out ref_small_jks.apk small.apk
+# Unaligned copies (Python's zipfile writes no alignment padding) + apksigner's output for them:
+# the zipalign rewrite path must reproduce apksigner byte for byte.
+python3 - <<'PY'
+import zipfile
+for src, dst in [('small.apk', 'ua_small.apk'), ('big.apk', 'ua_big.apk')]:
+    with zipfile.ZipFile(src) as zi, zipfile.ZipFile(dst, 'w') as zo:
+        for i in zi.infolist():
+            zo.writestr(i, zi.read(i.filename), compress_type=i.compress_type)
+PY
+$AS sign --key rsa.pk8 --cert rsa.cert.pem --v1-signing-enabled false --out ref_ua_small.apk ua_small.apk
+$AS sign --key rsa.pk8 --cert rsa.cert.pem --v1-signing-enabled false --out ref_ua_big.apk ua_big.apk
 rm -f *.idsig
 ls -la

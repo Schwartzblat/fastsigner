@@ -4,14 +4,18 @@
 //! parallel chunked digest → build v2/v3 blocks → APK Signing Block → splice the tail.
 //! Several APKs can be signed concurrently with one shared key.
 
+mod align;
 mod digest;
 mod jks;
 mod keys;
 mod sigblock;
 mod zip;
 
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Read, Seek, Write};
+use std::os::raw::{c_char, c_int, c_uint};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -44,6 +48,10 @@ OUTPUT:
     --out-dir <dir>               Write <dir>/<input file name> for every input
 
 OPTIONS:
+    --zipalign [true|false|always] Default true: check 4-byte alignment of stored entries and page
+                                  alignment of .so files; rewrite the entries only if misaligned.
+                                  `always` rewrites unconditionally (apksigner-style normalisation)
+    --lib-page-size <KiB>         Page size for .so alignment, default 16 (zipalign -P 16); 0 = off
     --v2-signing-enabled [bool]   Default true
     --v3-signing-enabled [bool]   Default true
     --v1-signing-enabled [bool]   Default false. `true` is NOT IMPLEMENTED and exits with an error
@@ -54,11 +62,20 @@ OPTIONS:
     -h, --help                    This text
 ";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZipAlign {
+    Off,
+    Check,
+    Always,
+}
+
 #[derive(Clone, Copy)]
 struct Opts {
     v2: bool,
     v3: bool,
     timing: bool,
+    zipalign: ZipAlign,
+    lib_page_size: u32,
 }
 
 enum KeySource {
@@ -93,6 +110,8 @@ fn parse_args() -> Result<Args, String> {
     let (mut v1, mut v2, mut v3) = (false, true, true);
     let (mut jobs, mut threads) = (None, None);
     let mut timing = false;
+    let mut zipalign = ZipAlign::Check;
+    let mut lib_page_size: u32 = 16 << 10;
     let mut i = 0;
     let value = |i: &mut usize, name: &str| -> Result<String, String> {
         *i += 1;
@@ -129,6 +148,25 @@ fn parse_args() -> Result<Args, String> {
                 value(&mut i, a)?.parse::<u32>().map_err(|_| "--min-sdk-version must be a number")?;
             }
             "--timing" => timing = true,
+            "--zipalign" => {
+                if argv.get(i + 1).map(|s| s.as_str()) == Some("always") {
+                    i += 1;
+                    zipalign = ZipAlign::Always;
+                } else {
+                    let (b, consumed) = parse_bool(argv.get(i + 1));
+                    if consumed {
+                        i += 1;
+                    }
+                    zipalign = if b { ZipAlign::Check } else { ZipAlign::Off };
+                }
+            }
+            "--lib-page-size" => {
+                let kib: u32 = value(&mut i, a)?.parse().map_err(|_| "--lib-page-size must be a number of KiB (0, 4, 16, 64)")?;
+                if kib != 0 && !kib.is_power_of_two() || kib > 64 {
+                    return Err("--lib-page-size must be 0 or a power of two up to 64 (KiB)".into());
+                }
+                lib_page_size = kib << 10;
+            }
             "--v1-signing-enabled" | "--v2-signing-enabled" | "--v3-signing-enabled" => {
                 let (b, consumed) = parse_bool(argv.get(i + 1));
                 if consumed {
@@ -161,7 +199,7 @@ fn parse_args() -> Result<Args, String> {
     if out.is_some() && out_dir.is_some() {
         return Err("--out and --out-dir are mutually exclusive".into());
     }
-    Ok(Args { inputs, out, out_dir, keysrc, v1, jobs, threads, opts: Opts { v2, v3, timing } })
+    Ok(Args { inputs, out, out_dir, keysrc, v1, jobs, threads, opts: Opts { v2, v3, timing, zipalign, lib_page_size } })
 }
 
 /// apksigner password sources: pass:<pw>, env:<VAR>, file:<path> (first line), stdin.
@@ -251,6 +289,97 @@ impl Timings {
     }
 }
 
+/// A file created for output that is removed on drop unless committed.
+struct TempFile {
+    path: Option<PathBuf>,
+}
+
+extern "C" {
+    fn renameat2(olddirfd: c_int, oldpath: *const c_char, newdirfd: c_int, newpath: *const c_char, flags: c_uint) -> c_int;
+}
+const AT_FDCWD: c_int = -100;
+const RENAME_EXCHANGE: c_uint = 2;
+
+/// Replace `dest` with `temp`. Swapping the two names atomically and unlinking the old content
+/// avoids ext4's replace-via-rename data flush (`auto_da_alloc`), which costs ~30 ms for a
+/// freshly written 145 MB file; a plain rename is the fallback.
+fn replace_file(temp: &Path, dest: &Path) -> io::Result<()> {
+    let (a, b) = (CString::new(temp.as_os_str().as_bytes())?, CString::new(dest.as_os_str().as_bytes())?);
+    // SAFETY: both pointers are valid NUL-terminated paths for the duration of the call.
+    if unsafe { renameat2(AT_FDCWD, a.as_ptr(), AT_FDCWD, b.as_ptr(), RENAME_EXCHANGE) } == 0 {
+        std::fs::remove_file(temp)
+    } else {
+        std::fs::rename(temp, dest)
+    }
+}
+
+impl TempFile {
+    fn commit(mut self, dest: &Path) -> Result<(), String> {
+        let p = self.path.take().unwrap();
+        replace_file(&p, dest).map_err(|e| {
+            std::fs::remove_file(&p).ok();
+            format!("replace {} with {}: {e}", dest.display(), p.display())
+        })
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if let Some(p) = &self.path {
+            std::fs::remove_file(p).ok();
+        }
+    }
+}
+
+fn open_rw_truncate(path: &Path) -> Result<File, String> {
+    OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// EOCD with entry count / CD size patched (CD offset still to be set), the EOCD variant used
+/// for digesting (CD offset = signing block start), the padding before the block and the block
+/// start, for a given entries section length.
+fn layout(entries_end: u64, cd_len: usize, eocd_template: &[u8], entry_count: u64) -> (Vec<u8>, Vec<u8>, u64, u64) {
+    let pad = sigblock::padding_before_block(entries_end);
+    let block_start = entries_end + pad;
+    let mut eocd = eocd_template.to_vec();
+    zip::set_eocd_entry_count(&mut eocd, entry_count as u16);
+    zip::set_eocd_cd_size(&mut eocd, cd_len as u32);
+    let mut eocd_for_digest = eocd.clone();
+    zip::set_eocd_cd_offset(&mut eocd_for_digest, block_start as u32);
+    (eocd, eocd_for_digest, pad, block_start)
+}
+
+/// Fast path: digest the APK as it would look with the signing block spliced in, straight from
+/// the input file. Returns (content digest, patched EOCD, padding, block start).
+fn digest_layout(
+    file: &File,
+    entries_end: u64,
+    cd: &[u8],
+    eocd_template: &[u8],
+    entry_count: u64,
+    signer: &Signer,
+    threads: usize,
+    inspect: Option<&(dyn Fn(u64, &[u8]) + Sync)>,
+) -> Result<(Vec<u8>, Vec<u8>, u64, u64), String> {
+    let (eocd, eocd_for_digest, pad, block_start) = layout(entries_end, cd.len(), eocd_template, entry_count);
+    let zeros = vec![0u8; pad as usize];
+    let sources = [Source::file(0, entries_end, &zeros), Source::bytes(cd), Source::bytes(&eocd_for_digest)];
+    let digests = digest::content_digests(file, &sources, &[signer.content_digest], threads, inspect).map_err(|e| format!("digest: {e}"))?;
+    Ok((digests.into_iter().next().unwrap(), eocd, pad, block_start))
+}
+
+/// Rewrite path: the entries section was digested while it was written; only the (in-memory)
+/// central directory and EOCD chunks remain.
+fn finish_rewritten_digest(rw: &align::Rewritten, eocd_template: &[u8], signer: &Signer) -> (Vec<u8>, Vec<u8>, u64, u64) {
+    let (eocd, eocd_for_digest, pad, block_start) = layout(rw.entries_end, rw.cd.len(), eocd_template, rw.entries);
+    debug_assert_eq!(pad, rw.pad);
+    let alg = signer.content_digest;
+    let (n_cd, d_cd) = digest::chunk_digests_of(alg, &rw.cd);
+    let (n_eocd, d_eocd) = digest::chunk_digests_of(alg, &eocd_for_digest);
+    let digest = digest::top_digest(alg, rw.chunk_count + n_cd + n_eocd, &[&rw.chunk_digests, &d_cd, &d_eocd]);
+    (digest, eocd, pad, block_start)
+}
+
 /// Sign one APK. Returns the `--timing` report (empty unless enabled).
 fn sign_one(input: &Path, output: Option<&Path>, signer: &Signer, threads: usize, opts: Opts) -> Result<String, String> {
     let mut tm = Timings { t0: Instant::now(), marks: Vec::new() };
@@ -264,35 +393,105 @@ fn sign_one(input: &Path, output: Option<&Path>, signer: &Signer, threads: usize
 
     // --- ZIP structure ---------------------------------------------------------------------
     let sections = zip::parse(&file)?;
-    let mut cd = vec![0u8; sections.cd_size as usize];
-    file.read_exact_at(&mut cd, sections.cd_off).map_err(|e| format!("read central directory: {e}"))?;
-    let filtered = zip::strip_v1_signature_entries(&cd)?;
-    let cd = filtered.bytes;
-    if filtered.entries > u16::MAX as u64 {
-        return Err("too many entries for a non-Zip64 archive".into());
-    }
-
-    let entries_end = sections.entries_end;
-    let pad = sigblock::padding_before_block(entries_end);
-    let block_start = entries_end + pad;
-    let zeros = vec![0u8; pad as usize];
-
-    let mut eocd = sections.eocd.clone();
-    zip::set_eocd_entry_count(&mut eocd, filtered.entries as u16);
-    zip::set_eocd_cd_size(&mut eocd, cd.len() as u32);
-    // For digesting, the EOCD's CD-offset field points at the signing block start.
-    let mut eocd_for_digest = eocd.clone();
-    zip::set_eocd_cd_offset(&mut eocd_for_digest, block_start as u32);
+    let mut cd_full = vec![0u8; sections.cd_size as usize];
+    file.read_exact_at(&mut cd_full, sections.cd_off).map_err(|e| format!("read central directory: {e}"))?;
+    let filtered = zip::filter_cd(&cd_full)?;
+    let mut cd = filtered.bytes;
+    let mut entry_count = filtered.entries;
+    let mut entries_end = sections.entries_end;
+    let policy = align::Policy { lib_page_size: opts.lib_page_size };
+    let entries = if opts.zipalign == ZipAlign::Check { Some(zip::parse_cd_entries(&cd)?) } else { None };
+    let inspector = match &entries {
+        Some(es) => Some(align::LfhInspector::new(es, entries_end)?),
+        None => None,
+    };
     tm.mark("parse");
 
-    // --- content digest --------------------------------------------------------------------
-    let sources = [Source::file(0, entries_end, &zeros), Source::bytes(&cd), Source::bytes(&eocd_for_digest)];
-    let digests = digest::content_digests(&file, &sources, &[signer.content_digest], threads).map_err(|e| format!("digest: {e}"))?;
-    let content_digest = &digests[0];
-    tm.mark("digest");
+    // Output file for a rewritten entries section: the --out path, or a temp swapped in later.
+    let open_dest = || -> Result<(File, Option<TempFile>), String> {
+        match output {
+            Some(p) => Ok((open_rw_truncate(p)?, None)),
+            None => {
+                let name = input.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let tmp_path = input.with_file_name(format!(".{name}.fastsigner-tmp"));
+                let f = open_rw_truncate(&tmp_path)?;
+                Ok((f, Some(TempFile { path: Some(tmp_path) })))
+            }
+        }
+    };
+    let mut rewritten: Option<(File, Option<TempFile>)> = None;
+    let mut align_note = match opts.zipalign {
+        ZipAlign::Off => "not checked".to_string(),
+        ZipAlign::Check => "aligned".to_string(),
+        ZipAlign::Always => String::new(),
+    };
+
+    // --- content digest (pass 1, with the alignment inspector riding along) ---------------
+    let (mut content_digest, mut eocd, mut pad, mut block_start);
+    if opts.zipalign == ZipAlign::Always {
+        let (dest, temp) = open_dest()?;
+        let rw = align::rewrite(&file, &cd_full, &filtered.all, &filtered.policies, entries_end, &dest, &policy, threads, signer.content_digest)?;
+        (content_digest, eocd, pad, block_start) = finish_rewritten_digest(&rw, &sections.eocd, signer);
+        cd = rw.cd;
+        entry_count = rw.entries;
+        entries_end = rw.entries_end;
+        align_note = format!("rewritten unconditionally ({} entries dropped; {})", rw.dropped, rw.stats);
+        rewritten = Some((dest, temp));
+        tm.mark("digest");
+    } else if entries.as_ref().map_or(Ok(false), |es| align::quick_misaligned(&file, &cd, es, entries_end, &policy, 16))? {
+        // Proven misaligned by a handful of header reads: skip digesting the old layout.
+        drop(inspector);
+        let (dest, temp) = open_dest()?;
+        let rw = align::rewrite(&file, &cd_full, &filtered.all, &filtered.policies, entries_end, &dest, &policy, threads, signer.content_digest)?;
+        (content_digest, eocd, pad, block_start) = finish_rewritten_digest(&rw, &sections.eocd, signer);
+        cd = rw.cd;
+        entry_count = rw.entries;
+        entries_end = rw.entries_end;
+        align_note = format!("realigned (misaligned within the first stored entries; {} entries dropped; {})", rw.dropped, rw.stats);
+        rewritten = Some((dest, temp));
+        tm.mark("digest");
+    } else {
+        let inspect_fn = inspector.as_ref().map(|i| move |o: u64, b: &[u8]| i.inspect(o, b));
+        (content_digest, eocd, pad, block_start) = digest_layout(
+            &file,
+            entries_end,
+            &cd,
+            &sections.eocd,
+            entry_count,
+            signer,
+            threads,
+            inspect_fn.as_ref().map(|f| f as &(dyn Fn(u64, &[u8]) + Sync)),
+        )?;
+        tm.mark("digest");
+
+        // --- zipalign: check, and rewrite + re-digest only when needed ----------------------
+        if let (Some(es), Some(insp)) = (&entries, inspector) {
+            let lens = insp.finish(&file, es)?;
+            let bad = align::check(&cd, es, &lens, entries_end, &policy)?;
+            if !bad.is_empty() {
+                let (dest, temp) = open_dest()?;
+                let rw = align::rewrite(&file, &cd_full, &filtered.all, &filtered.policies, entries_end, &dest, &policy, threads, signer.content_digest)?;
+                (content_digest, eocd, pad, block_start) = finish_rewritten_digest(&rw, &sections.eocd, signer);
+                cd = rw.cd;
+                entry_count = rw.entries;
+                entries_end = rw.entries_end;
+                align_note = format!(
+                    "realigned ({} misaligned, e.g. {:?} data at {} needs {}; {} entries dropped; {})",
+                    bad.len(),
+                    bad[0].name,
+                    bad[0].data_off,
+                    bad[0].required,
+                    rw.dropped,
+                    rw.stats
+                );
+                rewritten = Some((dest, temp));
+            }
+        }
+    }
+    tm.mark("align");
 
     // --- signature blocks ------------------------------------------------------------------
-    let inp = SignerInput { alg_id: signer.alg_id, digest: content_digest, certs: &signer.certs, spki: &signer.spki };
+    let inp = SignerInput { alg_id: signer.alg_id, digest: &content_digest, certs: &signer.certs, spki: &signer.spki };
     // v2 and v3 are independent signatures (each ~0.35 ms for RSA-2048); overlap them.
     let (v2_block, v3_block) = std::thread::scope(|s| {
         let v3 = opts.v3.then(|| s.spawn(|| sigblock::v3_signer(&inp, V3_MIN_SDK, V3_MAX_SDK, |d| signer.sign(d))));
@@ -315,19 +514,23 @@ fn sign_one(input: &Path, output: Option<&Path>, signer: &Signer, threads: usize
     tm.mark("sign");
 
     // --- write -----------------------------------------------------------------------------
-    let mut tail = Vec::with_capacity(zeros.len() + block.len() + cd.len() + eocd.len());
-    tail.extend_from_slice(&zeros);
+    let mut tail = Vec::with_capacity(pad as usize + block.len() + cd.len() + eocd.len());
+    tail.resize(pad as usize, 0);
     tail.extend_from_slice(&block);
     tail.extend_from_slice(&cd);
     tail.extend_from_slice(&eocd);
     let new_len = entries_end + tail.len() as u64;
 
-    match output {
-        None => {
+    match (&rewritten, output) {
+        (Some((dest, _)), _) => {
+            dest.write_all_at(&tail, entries_end).map_err(|e| format!("write: {e}"))?;
+            dest.set_len(new_len).map_err(|e| format!("truncate: {e}"))?;
+        }
+        (None, None) => {
             file.write_all_at(&tail, entries_end).map_err(|e| format!("write: {e}"))?;
             file.set_len(new_len).map_err(|e| format!("truncate: {e}"))?;
         }
-        Some(out_path) => {
+        (None, Some(out_path)) => {
             let mut out = File::create(out_path).map_err(|e| format!("{}: {e}", out_path.display()))?;
             let mut head = (&file).take(entries_end);
             let copied = io::copy(&mut head, &mut out).map_err(|e| format!("copy: {e}"))?;
@@ -338,13 +541,17 @@ fn sign_one(input: &Path, output: Option<&Path>, signer: &Signer, threads: usize
             out.write_all(&tail).map_err(|e| format!("write: {e}"))?;
         }
     }
+    if let Some((dest, Some(temp))) = rewritten {
+        drop(dest);
+        temp.commit(input)?;
+    }
     tm.mark("write");
 
     if !opts.timing {
         return Ok(String::new());
     }
     Ok(format!(
-        "fastsigner: {} ({} B{}) | {} | entries_end={} pad={} block={} B cd={} B ({} entries, {} v1 entries stripped) | {} threads | wrote {} B{}\n{}",
+        "fastsigner: {} ({} B{}) | {} | entries_end={} pad={} block={} B cd={} B ({} entries, {} stale entries removed) | zipalign: {} | {} threads | wrote {} B{}\n{}",
         input.display(),
         sections.file_len,
         match sections.sig_block {
@@ -356,8 +563,9 @@ fn sign_one(input: &Path, output: Option<&Path>, signer: &Signer, threads: usize
         pad,
         block.len(),
         cd.len(),
-        filtered.entries,
+        entry_count,
         filtered.removed.len(),
+        align_note,
         threads,
         tail.len(),
         match output {

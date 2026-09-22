@@ -9,6 +9,8 @@ KNOWLEDGE.md §5 (~13 ms on `big.apk` vs apksigner's 410 ms).
   ≤3072-bit keys, SHA-512 above) and ECDSA P-256 keys, raw `pk8`/`pem` key + `pem` cert,
   JKS keystores (`--ks`, `--ks-pass`, `--ks-key-alias`, `--key-pass`; added later the same day),
   batch signing of many APKs with `--jobs` concurrency and `--out-dir`,
+  zipalign (check piggybacked on the digest pass; apksig-identical entries rewrite when
+  misaligned; `--lib-page-size`, default 16 KiB; added 2026-09-22),
   in-place splice write, parallel chunk digest on physical cores, stripping of stale
   `META-INF/` v1 signature entries from the central directory.
 - **Flagged out:** `--v1-signing-enabled true` exits with "not implemented" (KNOWLEDGE §6.1).
@@ -55,6 +57,7 @@ No `--out` = sign in place (only the tail of the file is rewritten).
 | `digest.rs` | parallel chunked content digest, physical core count | ring, zip::ReadAt |
 | `keys.rs` | PEM/DER loading, keystore entry selection, key type detection (with EC scalar fallback), SPKI extraction, sign+verify | ring, jks |
 | `jks.rs` | JKS reader: magic sniffing, integrity hash, entry parsing, KeyProtector decryption | ring (SHA-1) |
+| `align.rs` | `LfhInspector` (collects local header lengths from digest chunks), `quick_misaligned` (16-header sample), `check`, `rewrite` (apksig `ApkSigner.sign` step 3 semantics: 0xd935 padding, gaps copied verbatim; producers assemble + hash 1 MiB output chunks, one writer thread; returns the chunk digests so no second pass is needed) | zip, digest, sigblock |
 | `sigblock.rs` | v2/v3/APK-signing-block encoders (pure functions over bytes) | — |
 | `main.rs` | CLI, per-APK pipeline, batch scheduler (atomic queue over scoped threads, `cores/jobs` digest threads each), output writing, `--timing` | all |
 
@@ -76,3 +79,5 @@ hand-written on std. `memmap2`/`rayon`/`clap` deliberately not used; can be adde
 - Differential test: sign small/med/big with RSA and EC keys →
   `apksigner verify --verbose --min-sdk-version 24` must report v2 and v3 `true`.
 - Bench: `bench/bench_fastsigner.sh` vs the apksigner numbers in KNOWLEDGE.md §2.
+- Rewrite-path oracle: `tests/corpus_identity.sh` rebuilds every local APK unaligned and requires
+  fastsigner's output to equal apksigner's byte for byte.
