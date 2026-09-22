@@ -9,52 +9,17 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
+  release:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - run: cargo build --release --locked
 
-      - name: Package (unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          cd target/release
-          tar czf "${{ github.workspace }}/fastsigner-${{ matrix.target }}.tar.gz" fastsigner
-
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Compress-Archive -Path target/release/fastsigner.exe -DestinationPath fastsigner-${{ matrix.target }}.zip
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: fastsigner-${{ matrix.target }}
-          path: fastsigner-${{ matrix.target }}.*
-          if-no-files-found: error
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
+      - name: Package
+        run: tar czf fastsigner-x86_64-unknown-linux-gnu.tar.gz -C target/release fastsigner
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" artifacts/* --title "${{ github.ref_name }}" --generate-notes --repo "${{ github.repository }}"
+        run: gh release create "${{ github.ref_name }}" fastsigner-x86_64-unknown-linux-gnu.tar.gz --title "${{ github.ref_name }}" --generate-notes --repo "${{ github.repository }}"
