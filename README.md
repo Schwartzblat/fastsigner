@@ -31,7 +31,7 @@ fastsigner [sign] (--key key.pk8 --cert cert.pem | --ks store.jks --ks-pass pass
 
 key material
     --key <file> --cert <file>          PKCS#8/PKCS#1/SEC1 key + PEM/DER certificate chain
-    --ks <file>                         Java KeyStore (JKS); PKCS#12 and JCEKS are detected and rejected
+    --ks <file>                         JKS or PKCS#12 (PBES2/AES; detected from content); JCEKS rejected
     --ks-pass <src>                     pass:<pw> | env:<VAR> | file:<path> | stdin
     --ks-key-alias <alias>              optional when the store holds exactly one key
     --key-pass <src>                    defaults to the store password
@@ -91,9 +91,14 @@ On `big.apk` the floor is the kernel: ext4 serialises buffered writes to one fil
 so ~21 of those 28 ms are the write itself; reading, assembling and hashing hide behind it.
 
 Keys: unencrypted PKCS#8 (DER `.pk8` or PEM), PKCS#1 RSA or SEC1 EC, 2048–8192-bit RSA and EC P-256.
-Certificates: PEM or DER, chain allowed. JKS stores as written by `keytool -storetype JKS` or
-Android Studio; note that JDK 9+ `keytool` writes **PKCS#12** by default even for `.jks` names, and
-fastsigner tells you so rather than misreading the file. Generate a test pair with:
+Certificates: PEM or DER, chain allowed. Keystores: JKS as written by `keytool -storetype JKS` or
+Android Studio, and PKCS#12 as written by JDK 12+ `keytool` (its default, even for `.jks` names)
+or OpenSSL 3: PBES2 with PBKDF2-HMAC-SHA1/256/384/512 and AES-128/192/256-CBC, HMAC-SHA1/256/384/512
+MAC. The format is detected from the file, and aliases match case-insensitively as in Java. Legacy PKCS#12
+(3DES/RC2 from JDK 8–11 or `openssl -legacy`) is refused with a conversion hint:
+`keytool -importkeystore -srckeystore old.p12 -destkeystore new.p12 -deststoretype PKCS12` on a
+JDK 12+ re-encrypts it. Opening a PKCS#12 store costs ~2.5 ms of key derivation (keytool's 3 × 10 000
+PBKDF2/KDF iterations), paid once per process. Generate a test pair with:
 
 ```
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out k.pem
@@ -122,11 +127,13 @@ bench/bench_fastsigner.sh      # the table above
 
 | crate | purpose | why this one |
 |---|---|---|
-| [`ring`](https://crates.io/crates/ring) 0.17 | SHA-256/512, SHA-1 (JKS only), RSA PKCS#1 v1.5, ECDSA P-256, PKCS#8 parsing, RNG | one crate covers all crypto; BoringSSL assembly with SHA-NI; no system library. Needs a C compiler at build time. |
+| [`ring`](https://crates.io/crates/ring) 0.17 | SHA-256/512, SHA-1 (JKS, PKCS#12 MAC), HMAC, PBKDF2, RSA PKCS#1 v1.5, ECDSA P-256, PKCS#8 parsing, RNG | one crate covers all crypto; BoringSSL assembly with SHA-NI; no system library. Needs a C compiler at build time. |
+| [`aes`](https://crates.io/crates/aes) 0.9 | AES block cipher for PKCS#12 key/cert decryption | `ring` has no raw AES or CBC mode. RustCrypto's crate is pure Rust and constant-time (AES-NI when available). Pulls in `cipher`, `crypto-common`, `hybrid-array`, `typenum`, `inout`, `cpufeatures`, `cpubits`. |
+| [`cbc`](https://crates.io/crates/cbc) 0.2 | CBC mode on top of `aes` | built with `default-features = false`, which drops `block-padding`: PKCS#7 unpadding is checked by hand. Hand-writing AES was considered and rejected, because it would be security-sensitive code to maintain for a once-per-run operation. |
 
 Everything else is hand-written on `std`: CLI parsing, base64/PEM, a minimal DER walker (to pull
 the SubjectPublicKeyInfo out of the certificate and the scalar out of EC keys), the JKS reader and
-key protector, ZIP/EOCD/central-directory handling, the scoped-thread work pools (chunks within an
+key protector, the PKCS#12 container parser and its RFC 7292 KDF, ZIP/EOCD/central-directory handling, the scoped-thread work pools (chunks within an
 APK, APKs within a batch), and physical-core detection. `memmap2`, `rayon` and `clap` were
 considered and deliberately left out; `pread` into a per-thread 1 MiB buffer already reaches
 the SHA-NI limit.
@@ -134,7 +141,7 @@ the SHA-NI limit.
 ## Not implemented (yet)
 
 - v1 / JAR signing (`--v1-signing-enabled true` errors out; only devices below API 24 need it)
-- PKCS#12 and JCEKS keystores (would need AES-CBC / 3DES, i.e. the `aes`+`cbc` or `openssl` crates)
+- JCEKS keystores, legacy PKCS#12 encryption (3DES/RC2/RC4), PKCS#12 PBMAC1 and public-key modes
 - v3.1 lineage / key rotation, v4 `.idsig`, source stamps, multiple signers
 - Zip64 archives, DSA and P-384 keys
 - per-chunk digest caching for re-sign-after-patch (KNOWLEDGE.md §8, "novel optimisation")

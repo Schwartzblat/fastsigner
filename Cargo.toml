@@ -6,6 +6,10 @@ description = "Fast native APK signer (APK Signature Scheme v2 + v3)"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+# AES block cipher + CBC mode for PKCS#12 keystores (ring has neither); no default features, so no
+# block-padding crate: PKCS#7 unpadding is checked by hand in src/pkcs12.rs.
+aes = { version = "0.9", default-features = false }
+cbc = { version = "0.2", default-features = false }
 # SHA-256/512 (BoringSSL asm with SHA-NI), RSA PKCS#1 v1.5, ECDSA P-256, PKCS#8 parsing, RNG.
 ring = "0.17"
 

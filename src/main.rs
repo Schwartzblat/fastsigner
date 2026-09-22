@@ -8,6 +8,7 @@ mod align;
 mod digest;
 mod jks;
 mod keys;
+mod pkcs12;
 mod sigblock;
 mod zip;
 
@@ -36,11 +37,11 @@ USAGE:
 KEY MATERIAL:
     --key <file>                  Private key: PKCS#8 DER/PEM (RSA or EC P-256), PKCS#1 RSA, SEC1 EC
     --cert <file>                 X.509 certificate (chain), PEM or DER
-    --ks <file>                   Java KeyStore (JKS). PKCS#12/JCEKS are detected and rejected
+    --ks <file>                   Keystore: JKS, or PKCS#12 with PBES2/AES (JDK 12+ keytool, OpenSSL 3)
     --ks-pass <src>               Keystore password: pass:<pw> | env:<VAR> | file:<path> | stdin
     --ks-key-alias <alias>        Key alias (optional when the store has exactly one key)
     --key-pass <src>              Key password (default: same as --ks-pass)
-    --ks-type <type>              Only JKS is accepted
+    --ks-type <type>              JKS or PKCS12 (the format is detected from the file either way)
 
 OUTPUT:
     (none)                        Sign every input in place (only the tail of the file is rewritten)
@@ -136,8 +137,8 @@ fn parse_args() -> Result<Args, String> {
             "--key-pass" => key_pass = Some(value(&mut i, a)?),
             "--ks-type" => {
                 let t = value(&mut i, a)?;
-                if !t.eq_ignore_ascii_case("jks") {
-                    return Err(format!("--ks-type {t}: only JKS keystores are supported"));
+                if !t.eq_ignore_ascii_case("jks") && !t.eq_ignore_ascii_case("pkcs12") {
+                    return Err(format!("--ks-type {t}: only JKS and PKCS12 keystores are supported"));
                 }
             }
             "--out" => out = Some(PathBuf::from(value(&mut i, a)?)),

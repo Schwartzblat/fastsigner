@@ -571,8 +571,18 @@ Thread scaling on `big.apk`, digest phase, best of 5: 1 → 59.4 ms, 4 → 15.7,
 - **Gotcha: JDK 9+ `keytool` writes PKCS#12 by default**, even when the file is called `.jks`.
   The `test.jks` from the §1 baseline was in fact PKCS#12. fastsigner sniffs the magic
   (`FEEDFEED` JKS, `CECECECE` JCEKS, `30 82` PKCS#12) and refuses non-JKS stores with a
-  conversion hint instead of misreading them. PKCS#12 support would need AES-CBC (and 3DES for
-  legacy files), which `ring` does not have — that is a new-crate decision.
+  conversion hint instead of misreading them.
+- **PKCS#12 (added 2026-09-23).** `src/pkcs12.rs`, ~450 lines incl. tests, on `ring` (HMAC,
+  PBKDF2, digests) + RustCrypto `aes`/`cbc` (no default features; PKCS#7 unpadding by hand).
+  Scope: PBES2/PBKDF2/AES-CBC, i.e. JDK 12+ keytool and OpenSSL 3 defaults; legacy PBE
+  (3DES/RC2/RC4) is refused by name. Findings: the MAC key is the RFC 7292 B.2 KDF over the
+  BMPString password *with* its trailing 00 00, while PBKDF2 takes plain UTF-8. `openssl kdf
+  PKCS12KDF` takes raw bytes, so its vectors check the KDF core only (`hexpass:` reproduces the
+  RFC "smeg" vector). keytool encrypts the cert bag too, so a wrong store password with no MAC
+  shows up as a padding failure. Keys pair with certs by `localKeyId`, and chains are rebuilt
+  leaf-first by issuer → subject. Output is byte-identical to `apksigner --ks` for keytool,
+  OpenSSL and CA-chain stores. Cost: +2.5 ms per process (0.8 → 3.3 ms on tiny) for 3 × 10 000
+  KDF iterations; the binary grows ~80 KB.
 - **Java's EC keys omit the public key** from the PKCS#8 `ECPrivateKey`, which `ring`'s parser
   requires. Fix: pull the scalar out of the DER and rebuild the pair with the certificate's public
   point (`from_private_key_and_public_key`). The same path makes SEC1 `EC PRIVATE KEY` PEMs work.
@@ -663,7 +673,7 @@ kernel's page-cache write; only larger folios in ext4 or a different filesystem 
 ### 10.7 Open items (in the order worth doing)
 
 1. Install a fastsigner-signed, v2+v3-only, minSdk<24 APK on the API 36 AVD (§6.1 open test).
-2. PKCS#12 keystores (Android Studio debug keystores on modern JDKs) — needs an AES-CBC crate.
+2. ~~PKCS#12 keystores~~ — done 2026-09-23 (modern PBES2 only; legacy 3DES/RC2 refused).
 3. Per-chunk digest cache for the patch → re-sign loop (§8) — 5.6 ms → sub-millisecond on big
    (fast path only; the rewrite path is write-bound, see §10.6).
 4. v3.1 / lineage if rotation is ever needed; Zip64; v4 `.idsig` for `adb install --incremental`.

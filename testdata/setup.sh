@@ -28,6 +28,28 @@ if [ ! -f two.jks ]; then  # two keys, store password != key passwords
   keytool -genkeypair -storetype JKS -keystore two.jks -storepass storepw -keypass keypw22 -alias a -keyalg RSA -keysize 2048 -validity 3650 -dname "CN=a" >/dev/null 2>&1
   keytool -genkeypair -storetype JKS -keystore two.jks -storepass storepw -keypass keypw2b -alias B -keyalg EC -groupname secp256r1 -validity 3650 -dname "CN=b" >/dev/null 2>&1
 fi
+# PKCS#12 stores: JDK 12+ keytool and OpenSSL 3 both default to PBES2 (PBKDF2-HMAC-SHA256 +
+# AES-256-CBC) with an HMAC-SHA256 MAC. Variants cover AES-128, SHA-1 MAC and unencrypted cert bags.
+[ -f rsa.p12 ] || keytool -genkeypair -storetype PKCS12 -keystore rsa.p12 -storepass android -alias test \
+  -keyalg RSA -keysize 2048 -validity 3650 -dname "CN=fastsigner p12 rsa" >/dev/null 2>&1
+[ -f ec.p12 ] || keytool -genkeypair -storetype PKCS12 -keystore ec.p12 -storepass android -alias ECKey \
+  -keyalg EC -groupname secp256r1 -validity 3650 -dname "CN=fastsigner p12 ec" >/dev/null 2>&1
+if [ ! -f two.p12 ]; then
+  keytool -genkeypair -storetype PKCS12 -keystore two.p12 -storepass storepw -alias a -keyalg RSA -keysize 2048 -validity 3650 -dname "CN=a" >/dev/null 2>&1
+  keytool -genkeypair -storetype PKCS12 -keystore two.p12 -storepass storepw -alias B -keyalg EC -groupname secp256r1 -validity 3650 -dname "CN=b" >/dev/null 2>&1
+fi
+[ -f ossl.p12 ] || openssl pkcs12 -export -inkey rsa.key.pem -in rsa.cert.pem -name ossl -passout pass:android -out ossl.p12
+[ -f ossl_aes128_sha1mac.p12 ] || openssl pkcs12 -export -inkey ec.key.pem -in ec.cert.pem -name ec -passout pass:android \
+  -keypbe AES-128-CBC -certpbe NONE -macalg sha1 -out ossl_aes128_sha1mac.p12
+if [ ! -f chain.p12 ]; then  # CA-signed leaf; CA cert stored before the leaf to exercise chain ordering
+  openssl req -new -x509 -newkey rsa:2048 -nodes -keyout ca.key.pem -days 3650 -subj "/CN=fastsigner test CA" -out ca.cert.pem 2>/dev/null
+  openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key.pem -subj "/CN=fastsigner test leaf" -out leaf.csr 2>/dev/null
+  openssl x509 -req -in leaf.csr -CA ca.cert.pem -CAkey ca.key.pem -CAcreateserial -days 3650 -out leaf.cert.pem 2>/dev/null
+  cat ca.cert.pem leaf.cert.pem > chain.pem
+  openssl pkcs12 -export -inkey leaf.key.pem -in chain.pem -name leaf -passout pass:android -out chain.p12
+  rm -f leaf.csr ca.cert.srl chain.pem
+fi
+[ -f ossl_legacy.p12 ] || openssl pkcs12 -export -legacy -inkey rsa.key.pem -in rsa.cert.pem -name old -passout pass:android -out ossl_legacy.p12 2>/dev/null || true
 python3 - <<'PY'
 import zipfile
 man = zipfile.ZipFile('small.apk').read('AndroidManifest.xml')
@@ -38,6 +60,9 @@ $AS sign --key rsa.pk8 --cert rsa.cert.pem --v1-signing-enabled false --out ref_
 $AS sign --key ec.pk8 --cert ec.cert.pem --v1-signing-enabled false --out ref_small_ec.apk small.apk
 $AS sign --key rsa.pk8 --cert rsa.cert.pem --v1-signing-enabled false --v3-signing-enabled false --out ref_small_rsa_v2only.apk small.apk
 $AS sign --ks rsa.jks --ks-pass pass:android --ks-key-alias test --v1-signing-enabled false --out ref_small_jks.apk small.apk
+$AS sign --ks rsa.p12 --ks-pass pass:android --v1-signing-enabled false --out ref_small_p12.apk small.apk
+$AS sign --ks ossl.p12 --ks-pass pass:android --v1-signing-enabled false --out ref_small_ossl_p12.apk small.apk
+$AS sign --ks chain.p12 --ks-pass pass:android --v1-signing-enabled false --out ref_small_chain_p12.apk small.apk
 # Unaligned copies (Python's zipfile writes no alignment padding) + apksigner's output for them:
 # the zipalign rewrite path must reproduce apksigner byte for byte.
 python3 - <<'PY'

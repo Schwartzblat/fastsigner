@@ -4,6 +4,7 @@
 /testdata/*.pem
 /testdata/*.pk8
 /testdata/*.jks
+/testdata/*.p12
 
 # OS / editor cruft
 .DS_Store

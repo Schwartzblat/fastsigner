@@ -46,25 +46,30 @@ impl Signer {
         Signer::from_material(key_ders, certs).map_err(|e| format!("{}: {e}", key_path.display()))
     }
 
-    /// Java KeyStore (`--ks`). `alias == None` is accepted when the store has exactly one key.
+    /// Java KeyStore or PKCS#12 (`--ks`), told apart by content. `alias == None` is accepted when
+    /// the store has exactly one key.
     pub fn load_keystore(ks_path: &Path, store_password: &str, alias: Option<&str>, key_password: &str) -> Result<Signer, String> {
         let bytes = std::fs::read(ks_path).map_err(|e| format!("{}: {e}", ks_path.display()))?;
-        let ks = crate::jks::parse(&bytes, store_password).map_err(|e| format!("{}: {e}", ks_path.display()))?;
-        let available = || ks.keys.iter().map(|k| k.alias.as_str()).collect::<Vec<_>>().join(", ");
+        let (keys, recover): (_, fn(&[u8], &str) -> Result<Vec<u8>, String>) = match crate::jks::detect(&bytes) {
+            crate::jks::StoreKind::Pkcs12 => (crate::pkcs12::parse(&bytes, store_password).map(|s| s.keys), crate::pkcs12::recover_key),
+            _ => (crate::jks::parse(&bytes, store_password).map(|s| s.keys), crate::jks::recover_key),
+        };
+        let keys = keys.map_err(|e| format!("{}: {e}", ks_path.display()))?;
+        let available = || keys.iter().map(|k| k.alias.as_str()).collect::<Vec<_>>().join(", ");
         let entry = match alias {
             Some(a) => {
                 let want = a.to_lowercase();
-                ks.keys.iter().find(|k| k.alias == want).ok_or_else(|| {
+                keys.iter().find(|k| k.alias == want).ok_or_else(|| {
                     format!("{}: key alias {a:?} not found (available: {})", ks_path.display(), available())
                 })?
             }
-            None => match ks.keys.len() {
-                1 => &ks.keys[0],
+            None => match keys.len() {
+                1 => &keys[0],
                 0 => return Err(format!("{}: keystore contains no key entries", ks_path.display())),
                 n => return Err(format!("{}: keystore has {n} key entries, --ks-key-alias is required (available: {})", ks_path.display(), available())),
             },
         };
-        let pkcs8 = crate::jks::recover_key(&entry.protected_key, key_password)
+        let pkcs8 = recover(&entry.protected_key, key_password)
             .map_err(|e| format!("{}: alias {:?}: {e}", ks_path.display(), entry.alias))?;
         if entry.chain.is_empty() {
             return Err(format!("{}: alias {:?} has no certificate chain", ks_path.display(), entry.alias));
@@ -355,6 +360,21 @@ pub fn spki_from_cert(cert: &[u8]) -> Result<&[u8], String> {
     Ok(&cert[p..s + l])
 }
 
+/// Raw DER (issuer, subject) Names of an X.509 certificate.
+pub fn cert_issuer_subject(cert: &[u8]) -> Result<(&[u8], &[u8]), String> {
+    let (tbs_pos, _) = der_expect(cert, 0, 0x30)?; // Certificate
+    let (mut p, _) = der_expect(cert, tbs_pos, 0x30)?; // TBSCertificate
+    if let (0xa0, _, _) = der_header(cert, p)? {
+        p = der_skip(cert, p)?; // [0] EXPLICIT version
+    }
+    p = der_skip(cert, p)?; // serialNumber
+    p = der_skip(cert, p)?; // signature AlgorithmIdentifier
+    let issuer_end = der_skip(cert, p)?;
+    let subject_start = der_skip(cert, issuer_end)?; // skip validity
+    let subject_end = der_skip(cert, subject_start)?;
+    Ok((&cert[p..issuer_end], &cert[subject_start..subject_end]))
+}
+
 /// Contents of the BIT STRING inside a SubjectPublicKeyInfo (RSAPublicKey DER for RSA,
 /// uncompressed EC point for EC) — the form ring's verification API wants.
 pub fn spki_public_key_bits(spki: &[u8]) -> Result<&[u8], String> {
@@ -455,5 +475,33 @@ mod tests {
         assert!(Signer::load_keystore(Path::new("testdata/two.jks"), "storepw", Some("b"), "keypw22").err().unwrap().contains("wrong key password"));
         assert!(Signer::load_keystore(Path::new("testdata/two.jks"), "nope", Some("a"), "keypw22").err().unwrap().contains("integrity"));
         assert!(Signer::load_keystore(Path::new("testdata/two.jks"), "storepw", Some("zzz"), "x").err().unwrap().contains("not found"));
+    }
+
+    #[test]
+    fn load_from_pkcs12_keystores() {
+        if !Path::new("testdata/rsa.p12").exists() {
+            return;
+        }
+        let s = Signer::load_keystore(Path::new("testdata/rsa.p12"), "android", None, "android").unwrap();
+        assert_eq!(s.alg_id, ALG_RSA_PKCS1_SHA256);
+        assert!(s.sign(b"x").is_ok());
+        let s = Signer::load_keystore(Path::new("testdata/ec.p12"), "android", Some("ECKey"), "android").unwrap();
+        assert_eq!(s.alg_id, ALG_ECDSA_SHA256);
+        assert!(s.sign(b"x").is_ok());
+        assert!(Signer::load_keystore(Path::new("testdata/two.p12"), "storepw", None, "storepw").err().unwrap().contains("--ks-key-alias"));
+        assert!(Signer::load_keystore(Path::new("testdata/two.p12"), "storepw", Some("b"), "storepw").unwrap().sign(b"x").is_ok());
+        assert!(Signer::load_keystore(Path::new("testdata/two.p12"), "nope", Some("a"), "storepw").err().unwrap().contains("integrity"));
+        assert!(Signer::load_keystore(Path::new("testdata/two.p12"), "storepw", Some("a"), "nope").err().unwrap().contains("wrong key password"));
+        let s = Signer::load_keystore(Path::new("testdata/chain.p12"), "android", None, "android").unwrap();
+        assert!(s.sign(b"x").is_ok());
+        // One flipped byte inside the MAC-protected content must fail the integrity check.
+        let mut b = std::fs::read("testdata/rsa.p12").unwrap();
+        let n = b.len();
+        b[n / 2] ^= 1;
+        let tampered = std::env::temp_dir().join(format!("fastsigner-tampered-{}.p12", std::process::id()));
+        std::fs::write(&tampered, &b).unwrap();
+        let e = Signer::load_keystore(&tampered, "android", None, "android").err().unwrap();
+        let _ = std::fs::remove_file(&tampered);
+        assert!(e.contains("integrity") || e.contains("malformed"), "{e}");
     }
 }

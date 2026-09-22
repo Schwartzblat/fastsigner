@@ -95,7 +95,7 @@ pub fn parse(bytes: &[u8], store_password: &str) -> Result<Jks, String> {
     match detect(bytes) {
         StoreKind::Jks => {}
         StoreKind::Jceks => return Err("JCEKS keystores are not supported (convert with keytool -importkeystore -deststoretype JKS)".into()),
-        StoreKind::Pkcs12 => return Err("PKCS#12 keystores are not supported yet (convert with keytool -importkeystore -deststoretype JKS, or export the key with openssl pkcs12 -nodes and use --key/--cert)".into()),
+        StoreKind::Pkcs12 => return Err("not a JKS keystore (PKCS#12, see the pkcs12 module)".into()),
         StoreKind::Unknown => return Err("not a JKS keystore".into()),
     }
     let mut c = Cursor { b: bytes, p: 4 };

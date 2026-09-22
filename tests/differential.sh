@@ -38,6 +38,16 @@ $FS sign --ks two.jks --ks-pass pass:storepw --out t_x.apk small.apk 2>/dev/null
 $FS sign --ks two.jks --ks-pass pass:wrong --ks-key-alias a --out t_x.apk small.apk 2>/dev/null && bad "wrong store password refused" || ok "wrong store password refused"
 $FS sign --ks two.jks --ks-pass pass:storepw --ks-key-alias b --key-pass pass:keypw22 --out t_x.apk small.apk 2>/dev/null && bad "wrong key password refused" || ok "wrong key password refused"
 
+echo "== PKCS#12 keystores =="
+cp -f ref_small_p12.apk t_p1.apk && $FS sign --ks rsa.p12 --ks-pass pass:android t_p1.apk && cmp -s ref_small_p12.apk t_p1.apk && ok "PKCS#12 (keytool) RSA identical to apksigner --ks output" || bad "PKCS#12 keytool RSA identical"
+cp -f ref_small_ossl_p12.apk t_p2.apk && $FS sign --ks ossl.p12 --ks-pass pass:android --ks-type PKCS12 t_p2.apk && cmp -s ref_small_ossl_p12.apk t_p2.apk && ok "PKCS#12 (openssl) RSA identical to apksigner --ks output" || bad "PKCS#12 openssl RSA identical"
+cp -f ref_small_chain_p12.apk t_p3.apk && $FS sign --ks chain.p12 --ks-pass pass:android t_p3.apk && cmp -s ref_small_chain_p12.apk t_p3.apk && ok "PKCS#12 CA chain identical to apksigner --ks output" || bad "PKCS#12 chain identical"
+$FS sign --ks ec.p12 --ks-pass pass:android --ks-key-alias ECKEY --out t_p4.apk small.apk && verify t_p4.apk && ok "PKCS#12 EC key" || bad "PKCS#12 EC"
+$FS sign --ks two.p12 --ks-pass pass:storepw --ks-key-alias b --out t_p5.apk small.apk && verify t_p5.apk && ok "PKCS#12 two keys, alias b" || bad "PKCS#12 two.p12"
+$FS sign --ks ossl_aes128_sha1mac.p12 --ks-pass pass:android --out t_p6.apk small.apk && verify t_p6.apk && ok "PKCS#12 AES-128, SHA-1 MAC, plain cert bag" || bad "PKCS#12 aes128"
+$FS sign --ks rsa.p12 --ks-pass pass:wrong --out t_x.apk small.apk 2>/dev/null && bad "PKCS#12 wrong password refused" || ok "PKCS#12 wrong password refused"
+$FS sign --ks ossl_legacy.p12 --ks-pass pass:android --out t_x.apk small.apk 2>&1 | grep -q "legacy PKCS#12 encryption" && ok "legacy (RC2/3DES) PKCS#12 refused with a hint" || bad "legacy PKCS#12 message"
+
 echo "== batch mode =="
 rm -rf t_out && $FS sign --key rsa.pk8 --cert rsa.cert.pem --out-dir t_out tiny.apk small.apk med.apk big.apk && verify t_out/tiny.apk && verify t_out/small.apk && verify t_out/med.apk && verify t_out/big.apk && ok "--out-dir 4 APKs" || bad "--out-dir 4 APKs"
 for i in 1 2 3 4 5 6; do cp -f small.apk t_b$i.apk; done
