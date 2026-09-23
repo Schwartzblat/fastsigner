@@ -1,0 +1,5 @@
+# Link glibc statically: no dynamic loader, no relocation of libc/libgcc_s at start-up. Saves
+# ~0.12 ms of the ~0.75 ms a small APK takes end to end (KNOWLEDGE.md §10.7), and the release
+# binary no longer depends on the host's glibc version. It roughly doubles the binary (1 → 2 MB).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]

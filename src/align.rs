@@ -677,9 +677,9 @@ mod tests {
         let policy = Policy { lib_page_size: 4096 };
 
         let insp = LfhInspector::new(&entries, secs.entries_end).unwrap();
-        let src = [crate::digest::Source::file(0, secs.entries_end, &[])];
+        let src = [crate::digest::Source::file(0, &z[..secs.entries_end as usize], &[])];
         let f = |o: u64, b: &[u8]| insp.inspect(o, b);
-        crate::digest::content_digests(z.as_slice(), &src, &[&SHA256], 2, Some(&f)).unwrap();
+        crate::digest::content_digest(&src, &SHA256, &|| 2, crate::digest::Observers { inspect: Some(&f), release: None });
         let lens = insp.finish(z.as_slice(), &entries).unwrap();
         assert!(lens.iter().all(|&(nl, el)| el == 0 && nl > 0));
 
@@ -706,8 +706,8 @@ mod tests {
         // Digests produced while writing must equal the reference engine's over the written
         // bytes plus the zero padding.
         let zeros = vec![0u8; rw.pad as usize];
-        let reference = crate::digest::content_digests(body.as_slice(), &[crate::digest::Source::file(0, body.len() as u64, &zeros)], &[&SHA256], 2, None).unwrap();
-        assert_eq!(crate::digest::top_digest(&SHA256, rw.chunk_count, &[&rw.chunk_digests]), reference[0]);
+        let reference = crate::digest::content_digest(&[crate::digest::Source::file(0, &body, &zeros)], &SHA256, &|| 2, Default::default());
+        assert_eq!(crate::digest::top_digest(&SHA256, rw.chunk_count, &[&rw.chunk_digests]), reference);
         assert_eq!(rw.pad, crate::sigblock::padding_before_block(rw.entries_end));
 
         // Every surviving entry: header intact, data aligned, data bytes identical to the input.

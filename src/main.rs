@@ -8,24 +8,29 @@ mod align;
 mod digest;
 mod jks;
 mod keys;
+mod mmap;
 mod pkcs12;
+mod sha256;
 mod sigblock;
 mod zip;
 
+use std::borrow::Cow;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, Read, Seek, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::raw::{c_char, c_int, c_uint};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use digest::Source;
 use keys::Signer;
+use ring::digest::{Algorithm, SHA256};
+use mmap::Mmap;
 use sigblock::{SignerInput, V2_BLOCK_ID, V3_BLOCK_ID, V3_MAX_SDK, V3_MIN_SDK};
 
 const USAGE: &str = "\
@@ -240,6 +245,55 @@ fn load_signer(src: &KeySource) -> Result<Signer, String> {
     }
 }
 
+/// Whether loading the key is worth overlapping with the first APK: a PKCS#12 store spends
+/// ~0.8 ms in password-based key derivation, while key files and JKS stores load in ~40 µs, less
+/// than a thread takes to start.
+fn slow_to_load(src: &KeySource) -> bool {
+    let KeySource::Keystore { ks, .. } = src else { return false };
+    let mut magic = [0u8; 4];
+    File::open(ks).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && jks::detect(&magic) == jks::StoreKind::Pkcs12
+}
+
+/// The signing key, possibly still loading on another thread while APKs are parsed and digested.
+#[derive(Default)]
+struct PendingSigner {
+    signer: OnceLock<Result<Signer, String>>,
+    load_time: OnceLock<std::time::Duration>,
+}
+
+/// What `PendingSigner::wait` returns when loading failed; `run` reports the key's own error once.
+const KEY_FAILED: &str = "no key";
+
+impl PendingSigner {
+    fn load(&self, src: &KeySource) {
+        // Filled even if loading panics, so that no APK waits forever.
+        struct Fill<'a>(&'a OnceLock<Result<Signer, String>>);
+        impl Drop for Fill<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.set(Err("loading the key failed".into()));
+            }
+        }
+        let t = Instant::now();
+        let fill = Fill(&self.signer);
+        let _ = self.signer.set(load_signer(src));
+        drop(fill);
+        let _ = self.load_time.set(t.elapsed());
+    }
+
+    fn wait(&self) -> Result<&Signer, String> {
+        self.signer.wait().as_ref().map_err(|_| KEY_FAILED.to_string())
+    }
+
+    /// The content digest to start with: the key's if it is already loaded, else SHA-256, which
+    /// every key but RSA above 3072 bits uses (the digest is redone for those).
+    fn digest_guess(&self) -> &'static Algorithm {
+        match self.signer.get() {
+            Some(Ok(s)) => s.content_digest,
+            _ => &SHA256,
+        }
+    }
+}
+
 fn same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(x), Ok(y)) => x == y,
@@ -336,6 +390,15 @@ fn open_rw_truncate(path: &Path) -> Result<File, String> {
     OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// A fresh temp file next to `dest`, swapped in by `TempFile::commit`. Until then `dest` is
+/// untouched, so a failure (a wrong key, say) leaves an existing output as it was.
+fn temp_next_to(dest: &Path) -> Result<(File, TempFile), String> {
+    let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp_path = dest.with_file_name(format!(".{name}.fastsigner-tmp"));
+    let f = open_rw_truncate(&tmp_path)?;
+    Ok((f, TempFile { path: Some(tmp_path) }))
+}
+
 /// EOCD with entry count / CD size patched (CD offset still to be set), the EOCD variant used
 /// for digesting (CD offset = signing block start), the padding before the block and the block
 /// start, for a given entries section length.
@@ -351,22 +414,22 @@ fn layout(entries_end: u64, cd_len: usize, eocd_template: &[u8], entry_count: u6
 }
 
 /// Fast path: digest the APK as it would look with the signing block spliced in, straight from
-/// the input file. Returns (content digest, patched EOCD, padding, block start).
+/// the mapped input. Returns (content digest, patched EOCD, padding, block start).
 fn digest_layout(
-    file: &File,
+    apk: &[u8],
     entries_end: u64,
     cd: &[u8],
     eocd_template: &[u8],
     entry_count: u64,
-    signer: &Signer,
-    threads: usize,
-    inspect: Option<&(dyn Fn(u64, &[u8]) + Sync)>,
-) -> Result<(Vec<u8>, Vec<u8>, u64, u64), String> {
+    alg: &'static Algorithm,
+    threads: &dyn Fn() -> usize,
+    obs: digest::Observers,
+) -> (Vec<u8>, Vec<u8>, u64, u64) {
     let (eocd, eocd_for_digest, pad, block_start) = layout(entries_end, cd.len(), eocd_template, entry_count);
     let zeros = vec![0u8; pad as usize];
-    let sources = [Source::file(0, entries_end, &zeros), Source::bytes(cd), Source::bytes(&eocd_for_digest)];
-    let digests = digest::content_digests(file, &sources, &[signer.content_digest], threads, inspect).map_err(|e| format!("digest: {e}"))?;
-    Ok((digests.into_iter().next().unwrap(), eocd, pad, block_start))
+    let sources = [Source::file(0, &apk[..entries_end as usize], &zeros), Source::bytes(cd), Source::bytes(&eocd_for_digest)];
+    let digest = digest::content_digest(&sources, alg, threads, obs);
+    (digest, eocd, pad, block_start)
 }
 
 /// Rewrite path: the entries section was digested while it was written; only the (in-memory)
@@ -381,8 +444,9 @@ fn finish_rewritten_digest(rw: &align::Rewritten, eocd_template: &[u8], signer: 
     (digest, eocd, pad, block_start)
 }
 
-/// Sign one APK. Returns the `--timing` report (empty unless enabled).
-fn sign_one(input: &Path, output: Option<&Path>, signer: &Signer, threads: usize, opts: Opts) -> Result<String, String> {
+/// Sign one APK. `threads` is the digest thread count, asked for only when the APK is big enough
+/// to split. Returns the `--timing` report (empty unless enabled).
+fn sign_one(input: &Path, output: Option<&Path>, pending: &PendingSigner, threads: &dyn Fn() -> usize, opts: Opts) -> Result<String, String> {
     let mut tm = Timings { t0: Instant::now(), marks: Vec::new() };
     let in_place = output.is_none();
     let file = if in_place {
@@ -391,190 +455,228 @@ fn sign_one(input: &Path, output: Option<&Path>, signer: &Signer, threads: usize
         File::open(input)
     }
     .map_err(|e| e.to_string())?;
+    let map = Mmap::map(&file).map_err(|e| format!("map: {e}"))?;
+    let apk: &[u8] = &map;
 
     // --- ZIP structure ---------------------------------------------------------------------
-    let sections = zip::parse(&file)?;
-    let mut cd_full = vec![0u8; sections.cd_size as usize];
-    file.read_exact_at(&mut cd_full, sections.cd_off).map_err(|e| format!("read central directory: {e}"))?;
-    let filtered = zip::filter_cd(&cd_full)?;
+    let sections = zip::parse(apk)?;
+    let cd_full = &apk[sections.cd_off as usize..(sections.cd_off + sections.cd_size) as usize];
+    let filtered = zip::filter_cd(cd_full)?;
     let mut cd = filtered.bytes;
-    let mut entry_count = filtered.entries;
+    let mut entry_count = filtered.kept.len() as u64;
     let mut entries_end = sections.entries_end;
     let policy = align::Policy { lib_page_size: opts.lib_page_size };
-    let entries = if opts.zipalign == ZipAlign::Check { Some(zip::parse_cd_entries(&cd)?) } else { None };
+    // The rewrite digests what it writes, so it needs the key's digest algorithm up front.
+    let rewrite = |dest: &File| -> Result<(align::Rewritten, &Signer), String> {
+        let signer = pending.wait()?;
+        let (all, policies) = zip::classify(cd_full)?;
+        let rw = align::rewrite(&file, cd_full, &all, &policies, sections.entries_end, dest, &policy, threads(), signer.content_digest)?;
+        Ok((rw, signer))
+    };
+    let entries = (opts.zipalign == ZipAlign::Check).then_some(filtered.kept);
     let inspector = match &entries {
         Some(es) => Some(align::LfhInspector::new(es, entries_end)?),
         None => None,
     };
+    let dest_path = output.unwrap_or(input);
     tm.mark("parse");
 
-    // Output file for a rewritten entries section: the --out path, or a temp swapped in later.
-    let open_dest = || -> Result<(File, Option<TempFile>), String> {
-        match output {
-            Some(p) => Ok((open_rw_truncate(p)?, None)),
-            None => {
-                let name = input.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let tmp_path = input.with_file_name(format!(".{name}.fastsigner-tmp"));
-                let f = open_rw_truncate(&tmp_path)?;
-                Ok((f, Some(TempFile { path: Some(tmp_path) })))
+    std::thread::scope(|s| {
+        let mut rewritten: Option<(File, TempFile)> = None;
+        let mut align_note = match opts.zipalign {
+            ZipAlign::Off => "not checked".to_string(),
+            ZipAlign::Check => "aligned".to_string(),
+            ZipAlign::Always => String::new(),
+        };
+        // With --out, the unchanged head of the APK is copied while the digest runs: one
+        // page-cache write that would otherwise follow the digest.
+        let mut head_copy = None;
+
+        // --- content digest (pass 1, with the alignment inspector riding along) -----------
+        let (mut content_digest, mut eocd, mut pad, mut block_start);
+        let mut guessed_alg = None;
+        if opts.zipalign == ZipAlign::Always {
+            let (dest, temp) = temp_next_to(dest_path)?;
+            let (rw, signer) = rewrite(&dest)?;
+            (content_digest, eocd, pad, block_start) = finish_rewritten_digest(&rw, &sections.eocd, signer);
+            cd = Cow::Owned(rw.cd);
+            entry_count = rw.entries;
+            entries_end = rw.entries_end;
+            align_note = format!("rewritten unconditionally ({} entries dropped; {})", rw.dropped, rw.stats);
+            rewritten = Some((dest, temp));
+            tm.mark("digest");
+        } else if entries.as_ref().map_or(Ok(false), |es| align::quick_misaligned(apk, &cd, es, entries_end, &policy, 16))? {
+            // Proven misaligned by a handful of header reads: skip digesting the old layout.
+            drop(inspector);
+            let (dest, temp) = temp_next_to(dest_path)?;
+            let (rw, signer) = rewrite(&dest)?;
+            (content_digest, eocd, pad, block_start) = finish_rewritten_digest(&rw, &sections.eocd, signer);
+            cd = Cow::Owned(rw.cd);
+            entry_count = rw.entries;
+            entries_end = rw.entries_end;
+            align_note = format!("realigned (misaligned within the first stored entries; {} entries dropped; {})", rw.dropped, rw.stats);
+            rewritten = Some((dest, temp));
+            tm.mark("digest");
+        } else {
+            if let Some(out) = output {
+                let (dest, temp) = temp_next_to(out)?;
+                let file = &file;
+                head_copy = Some((
+                    s.spawn(move || -> io::Result<File> {
+                        let copied = io::copy(&mut file.take(entries_end), &mut &dest)?;
+                        if copied != entries_end {
+                            return Err(io::Error::other(format!("short copy: {copied} of {entries_end} bytes")));
+                        }
+                        Ok(dest)
+                    }),
+                    temp,
+                ));
+            }
+            let inspect_fn = inspector.as_ref().map(|i| move |o: u64, b: &[u8]| i.inspect(o, b));
+            let release_fn = |b: &[u8]| map.release(b);
+            let obs = digest::Observers { inspect: inspect_fn.as_ref().map(|f| f as &(dyn Fn(u64, &[u8]) + Sync)), release: Some(&release_fn) };
+            let alg = pending.digest_guess();
+            (content_digest, eocd, pad, block_start) = digest_layout(apk, entries_end, &cd, &sections.eocd, entry_count, alg, threads, obs);
+            guessed_alg = Some(alg);
+            tm.mark("digest");
+
+            // --- zipalign: check, and rewrite + re-digest only when needed ------------------
+            if let (Some(es), Some(insp)) = (&entries, inspector) {
+                let lens = insp.finish(apk, es)?;
+                let bad = align::check(&cd, es, &lens, entries_end, &policy)?;
+                if !bad.is_empty() {
+                    if let Some((h, temp)) = head_copy.take() {
+                        let _ = h.join();
+                        drop(temp);
+                    }
+                    let (dest, temp) = temp_next_to(dest_path)?;
+                    let (rw, signer) = rewrite(&dest)?;
+                    (content_digest, eocd, pad, block_start) = finish_rewritten_digest(&rw, &sections.eocd, signer);
+                    cd = Cow::Owned(rw.cd);
+                    entry_count = rw.entries;
+                    entries_end = rw.entries_end;
+                    align_note = format!(
+                        "realigned ({} misaligned, e.g. {:?} data at {} needs {}; {} entries dropped; {})",
+                        bad.len(),
+                        bad[0].name,
+                        bad[0].data_off,
+                        bad[0].required,
+                        rw.dropped,
+                        rw.stats
+                    );
+                    rewritten = Some((dest, temp));
+                    guessed_alg = None;
+                }
             }
         }
-    };
-    let mut rewritten: Option<(File, Option<TempFile>)> = None;
-    let mut align_note = match opts.zipalign {
-        ZipAlign::Off => "not checked".to_string(),
-        ZipAlign::Check => "aligned".to_string(),
-        ZipAlign::Always => String::new(),
-    };
+        tm.mark("align");
 
-    // --- content digest (pass 1, with the alignment inspector riding along) ---------------
-    let (mut content_digest, mut eocd, mut pad, mut block_start);
-    if opts.zipalign == ZipAlign::Always {
-        let (dest, temp) = open_dest()?;
-        let rw = align::rewrite(&file, &cd_full, &filtered.all, &filtered.policies, entries_end, &dest, &policy, threads, signer.content_digest)?;
-        (content_digest, eocd, pad, block_start) = finish_rewritten_digest(&rw, &sections.eocd, signer);
-        cd = rw.cd;
-        entry_count = rw.entries;
-        entries_end = rw.entries_end;
-        align_note = format!("rewritten unconditionally ({} entries dropped; {})", rw.dropped, rw.stats);
-        rewritten = Some((dest, temp));
-        tm.mark("digest");
-    } else if entries.as_ref().map_or(Ok(false), |es| align::quick_misaligned(&file, &cd, es, entries_end, &policy, 16))? {
-        // Proven misaligned by a handful of header reads: skip digesting the old layout.
-        drop(inspector);
-        let (dest, temp) = open_dest()?;
-        let rw = align::rewrite(&file, &cd_full, &filtered.all, &filtered.policies, entries_end, &dest, &policy, threads, signer.content_digest)?;
-        (content_digest, eocd, pad, block_start) = finish_rewritten_digest(&rw, &sections.eocd, signer);
-        cd = rw.cd;
-        entry_count = rw.entries;
-        entries_end = rw.entries_end;
-        align_note = format!("realigned (misaligned within the first stored entries; {} entries dropped; {})", rw.dropped, rw.stats);
-        rewritten = Some((dest, temp));
-        tm.mark("digest");
-    } else {
-        let inspect_fn = inspector.as_ref().map(|i| move |o: u64, b: &[u8]| i.inspect(o, b));
-        (content_digest, eocd, pad, block_start) = digest_layout(
-            &file,
+        // --- signature blocks --------------------------------------------------------------
+        let signer = pending.wait()?;
+        if guessed_alg.is_some_and(|alg| *alg != *signer.content_digest) {
+            (content_digest, eocd, pad, block_start) = digest_layout(apk, entries_end, &cd, &sections.eocd, entry_count, signer.content_digest, threads, Default::default());
+        }
+        let inp = SignerInput { alg_id: signer.alg_id, digest: &content_digest, certs: &signer.certs, spki: &signer.spki };
+        // v2 and v3 are independent signatures (each ~0.35 ms for RSA-2048); overlap them.
+        let (v2_block, v3_block) = std::thread::scope(|s| {
+            let v3 = opts.v3.then(|| s.spawn(|| sigblock::v3_signer(&inp, V3_MIN_SDK, V3_MAX_SDK, |d| signer.sign(d))));
+            let v2 = opts.v2.then(|| sigblock::v2_signer(&inp, opts.v3, |d| signer.sign(d)));
+            (v2, v3.map(|h| h.join().expect("v3 signer panicked")))
+        });
+        let mut pairs: Vec<(u32, Vec<u8>)> = Vec::new();
+        if let Some(b) = v2_block {
+            pairs.push((V2_BLOCK_ID, sigblock::scheme_block(&[b?])));
+        }
+        if let Some(b) = v3_block {
+            pairs.push((V3_BLOCK_ID, sigblock::scheme_block(&[b?])));
+        }
+        let block = sigblock::apk_signing_block(&pairs);
+        let new_cd_off = block_start + block.len() as u64;
+        if new_cd_off > u32::MAX as u64 {
+            return Err("output would exceed 4 GiB (Zip64 not supported)".into());
+        }
+        zip::set_eocd_cd_offset(&mut eocd, new_cd_off as u32);
+        tm.mark("sign");
+
+        // --- write: padding + signing block, central directory, EOCD -----------------------
+        let mut padded_block = vec![0u8; pad as usize];
+        padded_block.extend_from_slice(&block);
+        let mut tail: [&[u8]; 3] = [&padded_block, &cd, &eocd];
+        let new_len = entries_end + tail.iter().map(|p| p.len() as u64).sum::<u64>();
+        let write_tail = |f: &File, tail: &[&[u8]]| -> Result<usize, String> {
+            let mut off = entries_end;
+            for part in tail {
+                f.write_all_at(part, off).map_err(|e| format!("write: {e}"))?;
+                off += part.len() as u64;
+            }
+            Ok((off - entries_end) as usize)
+        };
+
+        let written = match (rewritten, head_copy) {
+            (Some((dest, temp)), _) => {
+                let n = write_tail(&dest, &tail)?;
+                dest.set_len(new_len).map_err(|e| format!("truncate: {e}"))?;
+                drop(dest);
+                temp.commit(dest_path)?;
+                n
+            }
+            (None, Some((h, temp))) => {
+                let dest = h.join().expect("head copy panicked").map_err(|e| format!("write: {e}"))?;
+                let n = write_tail(&dest, &tail)?;
+                drop(dest);
+                temp.commit(dest_path)?;
+                n
+            }
+            (None, None) => {
+                // In place. Re-signing an already signed APK usually leaves the central directory
+                // and EOCD exactly where and as they were: then only the block is written.
+                let old = &apk[entries_end as usize..];
+                let kept = cd.len() + eocd.len();
+                let owned_cd;
+                if new_len == sections.file_len && old[old.len() - kept..old.len() - eocd.len()] == *cd && old[old.len() - eocd.len()..] == eocd {
+                    tail = [&padded_block, &[], &[]];
+                } else if let Cow::Borrowed(b) = cd {
+                    // `cd` still points into the mapped file, which the block is about to overwrite.
+                    owned_cd = b.to_vec();
+                    tail[1] = &owned_cd;
+                }
+                let n = write_tail(&file, &tail)?;
+                if new_len != sections.file_len {
+                    file.set_len(new_len).map_err(|e| format!("truncate: {e}"))?;
+                }
+                n
+            }
+        };
+        tm.mark("write");
+
+        if !opts.timing {
+            return Ok(String::new());
+        }
+        Ok(format!(
+            "fastsigner: {} ({} B{}) | {} | entries_end={} pad={} block={} B cd={} B ({} entries, {} stale entries removed) | zipalign: {} | {} threads | wrote {} B{}\n{}",
+            input.display(),
+            sections.file_len,
+            match sections.sig_block {
+                Some((s, l)) => format!(", old signing block {l} B @ {s}"),
+                None => String::new(),
+            },
+            signer.description,
             entries_end,
-            &cd,
-            &sections.eocd,
+            pad,
+            block.len(),
+            cd.len(),
             entry_count,
-            signer,
-            threads,
-            inspect_fn.as_ref().map(|f| f as &(dyn Fn(u64, &[u8]) + Sync)),
-        )?;
-        tm.mark("digest");
-
-        // --- zipalign: check, and rewrite + re-digest only when needed ----------------------
-        if let (Some(es), Some(insp)) = (&entries, inspector) {
-            let lens = insp.finish(&file, es)?;
-            let bad = align::check(&cd, es, &lens, entries_end, &policy)?;
-            if !bad.is_empty() {
-                let (dest, temp) = open_dest()?;
-                let rw = align::rewrite(&file, &cd_full, &filtered.all, &filtered.policies, entries_end, &dest, &policy, threads, signer.content_digest)?;
-                (content_digest, eocd, pad, block_start) = finish_rewritten_digest(&rw, &sections.eocd, signer);
-                cd = rw.cd;
-                entry_count = rw.entries;
-                entries_end = rw.entries_end;
-                align_note = format!(
-                    "realigned ({} misaligned, e.g. {:?} data at {} needs {}; {} entries dropped; {})",
-                    bad.len(),
-                    bad[0].name,
-                    bad[0].data_off,
-                    bad[0].required,
-                    rw.dropped,
-                    rw.stats
-                );
-                rewritten = Some((dest, temp));
-            }
-        }
-    }
-    tm.mark("align");
-
-    // --- signature blocks ------------------------------------------------------------------
-    let inp = SignerInput { alg_id: signer.alg_id, digest: &content_digest, certs: &signer.certs, spki: &signer.spki };
-    // v2 and v3 are independent signatures (each ~0.35 ms for RSA-2048); overlap them.
-    let (v2_block, v3_block) = std::thread::scope(|s| {
-        let v3 = opts.v3.then(|| s.spawn(|| sigblock::v3_signer(&inp, V3_MIN_SDK, V3_MAX_SDK, |d| signer.sign(d))));
-        let v2 = opts.v2.then(|| sigblock::v2_signer(&inp, opts.v3, |d| signer.sign(d)));
-        (v2, v3.map(|h| h.join().expect("v3 signer panicked")))
-    });
-    let mut pairs: Vec<(u32, Vec<u8>)> = Vec::new();
-    if let Some(b) = v2_block {
-        pairs.push((V2_BLOCK_ID, sigblock::scheme_block(&[b?])));
-    }
-    if let Some(b) = v3_block {
-        pairs.push((V3_BLOCK_ID, sigblock::scheme_block(&[b?])));
-    }
-    let block = sigblock::apk_signing_block(&pairs);
-    let new_cd_off = block_start + block.len() as u64;
-    if new_cd_off > u32::MAX as u64 {
-        return Err("output would exceed 4 GiB (Zip64 not supported)".into());
-    }
-    zip::set_eocd_cd_offset(&mut eocd, new_cd_off as u32);
-    tm.mark("sign");
-
-    // --- write -----------------------------------------------------------------------------
-    let mut tail = Vec::with_capacity(pad as usize + block.len() + cd.len() + eocd.len());
-    tail.resize(pad as usize, 0);
-    tail.extend_from_slice(&block);
-    tail.extend_from_slice(&cd);
-    tail.extend_from_slice(&eocd);
-    let new_len = entries_end + tail.len() as u64;
-
-    match (&rewritten, output) {
-        (Some((dest, _)), _) => {
-            dest.write_all_at(&tail, entries_end).map_err(|e| format!("write: {e}"))?;
-            dest.set_len(new_len).map_err(|e| format!("truncate: {e}"))?;
-        }
-        (None, None) => {
-            file.write_all_at(&tail, entries_end).map_err(|e| format!("write: {e}"))?;
-            file.set_len(new_len).map_err(|e| format!("truncate: {e}"))?;
-        }
-        (None, Some(out_path)) => {
-            let mut out = File::create(out_path).map_err(|e| format!("{}: {e}", out_path.display()))?;
-            let mut head = (&file).take(entries_end);
-            let copied = io::copy(&mut head, &mut out).map_err(|e| format!("copy: {e}"))?;
-            if copied != entries_end {
-                return Err(format!("short copy: {copied} of {entries_end} bytes"));
-            }
-            out.seek(io::SeekFrom::Start(entries_end)).map_err(|e| e.to_string())?;
-            out.write_all(&tail).map_err(|e| format!("write: {e}"))?;
-        }
-    }
-    if let Some((dest, Some(temp))) = rewritten {
-        drop(dest);
-        temp.commit(input)?;
-    }
-    tm.mark("write");
-
-    if !opts.timing {
-        return Ok(String::new());
-    }
-    Ok(format!(
-        "fastsigner: {} ({} B{}) | {} | entries_end={} pad={} block={} B cd={} B ({} entries, {} stale entries removed) | zipalign: {} | {} threads | wrote {} B{}\n{}",
-        input.display(),
-        sections.file_len,
-        match sections.sig_block {
-            Some((s, l)) => format!(", old signing block {l} B @ {s}"),
-            None => String::new(),
-        },
-        signer.description,
-        entries_end,
-        pad,
-        block.len(),
-        cd.len(),
-        entry_count,
-        filtered.removed.len(),
-        align_note,
-        threads,
-        tail.len(),
-        match output {
-            None => " in place".to_string(),
-            Some(o) => format!(" to {}", o.display()),
-        },
-        tm.render(),
-    ))
+            filtered.removed.len(),
+            align_note,
+            threads(),
+            written,
+            match output {
+                None => " in place".to_string(),
+                Some(o) => format!(" to {}", o.display()),
+            },
+            tm.render(),
+        ))
+    })
 }
 
 fn run() -> Result<(), String> {
@@ -590,24 +692,35 @@ fn run() -> Result<(), String> {
     }
 
     let outputs = plan_outputs(&args)?;
-    let signer = load_signer(&args.keysrc)?;
-    let t_keys = t0.elapsed();
+    let pending = PendingSigner::default();
 
+    // Counting cores reads a handful of cgroup and sysfs files (~40 µs, a tenth of what a small
+    // APK takes), so a single APK that fits in one chunk never does it.
     let n = args.inputs.len();
-    let cores = digest::physical_cores();
-    let jobs = args.jobs.unwrap_or(cores).min(n).max(1);
-    let threads = args.threads.unwrap_or_else(|| (cores / jobs).max(1));
+    let cores = OnceLock::new();
+    let cores = || *cores.get_or_init(digest::physical_cores);
+    let jobs = if n == 1 { 1 } else { args.jobs.unwrap_or_else(cores).min(n).max(1) };
+    let threads = || args.threads.unwrap_or_else(|| (cores() / jobs).max(1));
 
     let results: Mutex<Vec<(usize, Result<String, String>)>> = Mutex::new(Vec::with_capacity(n));
     let work = |idx: usize| {
-        let r = sign_one(&args.inputs[idx], outputs[idx].as_deref(), &signer, threads, args.opts);
+        let r = sign_one(&args.inputs[idx], outputs[idx].as_deref(), &pending, &threads, args.opts);
         results.lock().unwrap().push((idx, r));
     };
-    if jobs == 1 {
-        (0..n).for_each(work);
-    } else {
-        let next = AtomicUsize::new(0);
-        std::thread::scope(|s| {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        // A PKCS#12 store's key derivation runs while the first APKs are parsed and digested.
+        if slow_to_load(&args.keysrc) {
+            s.spawn(|| pending.load(&args.keysrc));
+        } else {
+            pending.load(&args.keysrc);
+            if let Some(Err(_)) = pending.signer.get() {
+                return;
+            }
+        }
+        if jobs == 1 {
+            (0..n).for_each(work);
+        } else {
             for _ in 0..jobs {
                 s.spawn(|| loop {
                     let idx = next.fetch_add(1, Ordering::Relaxed);
@@ -617,7 +730,10 @@ fn run() -> Result<(), String> {
                     work(idx);
                 });
             }
-        });
+        }
+    });
+    if let Some(Err(e)) = pending.signer.get() {
+        return Err(e.clone());
     }
 
     let mut results = results.into_inner().unwrap();
@@ -642,9 +758,9 @@ fn run() -> Result<(), String> {
             "fastsigner: {} APK(s), {} failed | keys {:.3} ms | {} job(s) × {} thread(s) | wall {:.3} ms",
             n,
             failed,
-            t_keys.as_secs_f64() * 1e3,
+            pending.load_time.get().map_or(0.0, |t| t.as_secs_f64() * 1e3),
             jobs,
-            threads,
+            threads(),
             t0.elapsed().as_secs_f64() * 1e3
         );
     }
@@ -658,5 +774,42 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("fastsigner: error: {e}");
         exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// In place, `--out` and a second in-place pass must give the same bytes (RSA signatures are
+    /// deterministic). tiny.apk is unsigned, so its new block lands on the old central directory,
+    /// which the in-place writer must not read back out of the mapped file after overwriting it;
+    /// the second pass takes the unchanged-tail shortcut.
+    #[test]
+    fn in_place_equals_out_and_re_sign_is_stable() {
+        let (key, cert) = (Path::new("testdata/rsa.pk8"), Path::new("testdata/rsa.cert.pem"));
+        if !key.exists() || !cert.exists() {
+            return;
+        }
+        let signer = PendingSigner::default();
+        signer.load(&KeySource::Files { key: key.into(), cert: cert.into() });
+        let opts = Opts { v2: true, v3: true, timing: false, zipalign: ZipAlign::Check, lib_page_size: 16 << 10 };
+        let dir = std::env::temp_dir().join(format!("fastsigner-inplace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["tiny.apk", "small.apk"] {
+            let src = Path::new("testdata").join(name);
+            if !src.exists() {
+                continue;
+            }
+            let (out, in_place) = (dir.join(format!("out-{name}")), dir.join(format!("in-{name}")));
+            std::fs::copy(&src, &in_place).unwrap();
+            sign_one(&src, Some(&out), &signer, &|| 4, opts).unwrap();
+            sign_one(&in_place, None, &signer, &|| 4, opts).unwrap();
+            let want = std::fs::read(&out).unwrap();
+            assert!(std::fs::read(&in_place).unwrap() == want, "{name}: in place differs from --out");
+            sign_one(&in_place, None, &signer, &|| 4, opts).unwrap();
+            assert!(std::fs::read(&in_place).unwrap() == want, "{name}: re-signing in place changed the file");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -670,10 +670,98 @@ Net: unaligned big 33.6 → **27.5 ms** in place, unaligned small 3.4 → **1.9 
 byte identity with apksigner unchanged (100/100 corpus). The remaining 21 ms on big is the
 kernel's page-cache write; only larger folios in ext4 or a different filesystem move it.
 
-### 10.7 Open items (in the order worth doing)
+### 10.7 Speed pass (2026-09-23)
+
+Profiled a fresh process per run (that is how the tool is used), on ext4, warm page cache,
+timing spawn to exit with `bench/runbench.c` (`date` in a shell adds ~1.5 ms, more than a small
+APK takes). Before → after, median, RSA-2048:
+
+| | tiny | small | med | big |
+|---|---:|---:|---:|---:|
+| in place, pk8 key | 0.75 → **0.63** | 1.71 → **1.17** | 4.46 → **2.96** | 7.67 → **5.03** ms |
+| in place, PKCS#12 (keytool) | 3.01 → **1.35** | 3.98 → **1.40** | 6.95 → **3.02** | 10.09 → **5.18** ms |
+| `--out`, output exists | 0.81 → **0.66** | 2.13 → **1.30** | 23.6 → **11.0** | 50.7 → **25.4** ms |
+| batch, default jobs | | 8 × small 3.2 → **2.0** | | 3 × big 17.5 → **12.6** ms |
+
+Where the time went on `big.apk` before: parse 0.7 ms, digest 6.0 ms, sign 0.4 ms, write 0.2 ms.
+
+**SHA-256, two messages per core.** `sha256rnds2` has ~4 cycles of latency, and one message is a
+single chain of 32 of them per block: 2.8 GB/s per core, ring and a hand-written SHA-NI loop
+alike. Interleaving two independent messages in one thread (the kernel's `sha256_ni_finup2x`
+idea) gives 4.1 GB/s on one core and 55.8 GB/s on 16 (in cache; 32.6 GB/s one stream each).
+The v2 digest is made of independent 1 MiB chunks, so each worker keeps two in flight
+("lanes") and refills a lane from the shared counter as soon as its chunk ends. It takes a
+second chunk only while at least `threads` chunks remain; when chunks run short, one chunk per
+core at 1-way speed beats two on one core (small APKs have 4–6 chunks). Single-thread digest of
+`big.apk`: 57 → 40 ms.
+
+**The fresh-process tax was bigger than the hashing.** The same pread design measured 4.2 ms in a
+warm loop but 5.5–6.5 ms in a new process: workers started 430 µs late (130 µs when warm),
+most likely because each one mapped and faulted in a fresh 1 MiB buffer while the main thread
+was still mapping thread stacks, all of which takes `mmap_lock`. Hashing straight out of an `mmap` of the APK
+removes the buffers and the copy (`src/mmap.rs`, two libc calls, no crate).
+
+**…but `munmap` of a fully faulted 145 MB mapping costs 0.4–0.7 ms on ext4 and 1.1–3.2 ms on
+tmpfs**, serially, at the end (per-page rmap work; tmpfs has 4 KiB pages here, ext4 is cheaper,
+presumably thanks to large folios). Fix: each worker `madvise(MADV_DONTNEED)`s its chunk after hashing it, which
+spreads the teardown over the threads while they run; the final `munmap` is ~free. Fresh-process
+digest of `big.apk` (ext4): pread + ring 5.3–5.6 ms → mmap + lanes 4.0–4.2 → + DONTNEED
+**3.5 ms**. `pread` into two 64 KiB windows per lane is within 5% (64 KiB beat 16–256 KiB);
+mmap won because the parse can then borrow the central directory instead of copying it.
+
+**Floors.** Page cache → user memory tops out at ~67 GB/s here (4 threads of `pread`), so
+reading 145 MB costs ≥2.2 ms; we are at 3.5 ms including thread start-up (~12 µs per spawn on
+the spawning thread, ~50 µs before the first one runs) and the 1-way tail. Cold cache: ~26 ms for
+`big.apk` before and after — the NVMe (~5 GB/s for one sequential reader) is the limit.
+
+**Parse: 0.7 → 0.25 ms.** `filter_cd` took 0.5 ms for 15k entries, nearly all of it faulting in
+fresh ~1 MB vectors (entry list grown without a size hint, a filtered copy of the CD, a second
+parse for the zipalign check). Now the entry vector is reserved (`cd.len() / 46`), the CD is
+borrowed from the mapping when nothing is dropped, and the kept entries come out of the single
+parse. The rewrite path re-parses the full CD itself; it is 20+ ms anyway.
+
+**Writing.** In place, re-signing an already signed APK usually leaves the CD and EOCD where and
+as they were: compare, and write only the padded block (4 KB instead of 869 KB). One bug on the
+way, caught by `differential.sh` and now a unit test: with the CD borrowed from the mapping, the
+new block can land on the old CD, which then has to be copied out *before* the block is written.
+For `--out`, the head (all of the entries) is copied with `copy_file_range` on its own thread while
+the digest runs — 17 ms for 145 MB on ext4; writing from the mapping was slower (22 ms), and
+tmpfs does ~4.5 GB/s either way — into a temp file that is swapped in with
+`renameat2(RENAME_EXCHANGE)` (§10.5). The old code copied after the digest, and truncating and
+rewriting an existing 145 MB output cost it ~25 ms more than a fresh one: 50.7 → 25.4 ms.
+
+**PKCS#12: 2.5 → ~0.7 ms, and mostly hidden.** Per 10 000 iterations: PBKDF2-HMAC-SHA256 0.91 ms
+in ring, 0.67 ms with the pads absorbed once and two compressions per iteration on SHA-NI; the
+RFC 7292 MAC KDF 0.33 ms. The MAC, each encrypted SafeContents and each key the request can
+select are independent, so they run on their own threads (the MAC first, and its verdict is
+still reported first). The whole key load then runs on a thread of its own while the first APK
+is parsed and digested; the digest assumes SHA-256 (every key but RSA > 3072 bits) and is redone
+once if the key says SHA-512 (checked: RSA-4096 store, byte-identical to apksigner). Key files
+and JKS stores still load inline: ~40 µs, less than starting a thread.
+
+**Process start.** Static glibc (`.cargo/config.toml`) saves 0.12 ms of dynamic loading per
+run (binary 1 → 2 MB). `available_parallelism()` reads ~6 cgroup files (~30 µs) and the sysfs
+SMT width another ~6 µs; both are now only read when an APK has more than one chunk's worth of
+work.
+
+**Tried, no gain:**
+- More threads than cores: 24 digest threads are 6–8% faster than 16 on one med/big APK (the
+  1-way tail is shared with SMT siblings), 32 in between; but 8 × small in a batch gets 10%
+  slower. Default left at physical cores; `--threads` is there.
+- Starting the v3 signer thread before the digest (so its start-up overlaps): waking it from
+  its channel costs what spawning it did. Reverted.
+- `MADV_HUGEPAGE` on the mapping (no PMD mappings of ext4 page cache here), `MAP_POPULATE`
+  (serial, slower), a single malloc arena (`glibc.malloc.arena_max=1`, within noise).
+- Remaining big item not done: RSA-2048 signing is 330 µs in ring vs 159 µs in OpenSSL 3.5
+  (AVX-512 IFMA, `openssl speed rsa2048`), i.e. half of the tiny-APK time. Closing it means a
+  heavyweight dependency (aws-lc-rs) or hand-written constant-time IFMA Montgomery arithmetic.
+
+### 10.8 Open items (in the order worth doing)
 
 1. Install a fastsigner-signed, v2+v3-only, minSdk<24 APK on the API 36 AVD (§6.1 open test).
 2. ~~PKCS#12 keystores~~ — done 2026-09-23 (modern PBES2 only; legacy 3DES/RC2 refused).
-3. Per-chunk digest cache for the patch → re-sign loop (§8) — 5.6 ms → sub-millisecond on big
-   (fast path only; the rewrite path is write-bound, see §10.6).
-4. v3.1 / lineage if rotation is ever needed; Zip64; v4 `.idsig` for `adb install --incremental`.
+3. Per-chunk digest cache for the patch → re-sign loop (§8) — 3.5 ms → sub-millisecond on big
+   (fast path only; the rewrite path is write-bound, see §10.6). Only same-size patches keep the
+   chunk boundaries: any size change shifts every later 1 MiB chunk.
+4. Faster RSA-2048 signing (§10.7): the floor for small APKs.
+5. v3.1 / lineage if rotation is ever needed; Zip64; v4 `.idsig` for `adb install --incremental`.

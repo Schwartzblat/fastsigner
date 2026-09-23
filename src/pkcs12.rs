@@ -18,6 +18,7 @@ use std::num::NonZeroU32;
 
 use crate::jks::KeyEntry;
 use crate::keys::{cert_issuer_subject, der_header};
+use crate::sha256::ShaNi;
 
 const OID_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
 const OID_ENCRYPTED_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x06];
@@ -41,6 +42,14 @@ const MAX_NESTING: u32 = 4;
 
 pub struct Pkcs12 {
     pub keys: Vec<KeyEntry>,
+}
+
+/// The key a caller is going to ask for: `parse` decrypts the matching shrouded keys (all of
+/// them without an alias) while it derives the store's other keys.
+#[derive(Clone, Copy)]
+pub struct KeyRequest<'a> {
+    pub alias: Option<&'a str>,
+    pub password: &'a str,
 }
 
 /// A DER element: tag, contents, and the whole encoding (header included).
@@ -123,11 +132,18 @@ fn pkcs12_kdf(alg: &'static digest::Algorithm, pass: &[u8], salt: &[u8], id: u8,
         let mut ctx = digest::Context::new(alg);
         ctx.update(&d);
         ctx.update(&i_buf);
-        let mut a = ctx.finish();
-        for _ in 1..iterations {
-            a = digest::digest(alg, a.as_ref());
-        }
-        let a = a.as_ref();
+        let first = ctx.finish();
+        let a: Vec<u8> = match ShaNi::detect().filter(|_| *alg == digest::SHA256) {
+            Some(ni) => ni.iterate(first.as_ref().try_into().expect("SHA-256 output"), iterations - 1).to_vec(),
+            None => {
+                let mut a = first;
+                for _ in 1..iterations {
+                    a = digest::digest(alg, a.as_ref());
+                }
+                a.as_ref().to_vec()
+            }
+        };
+        let a = a.as_slice();
         out.extend_from_slice(&a[..u.min(n - out.len())]);
         if out.len() == n {
             return out;
@@ -236,6 +252,7 @@ fn pbes2_decrypt(alg: Tlv, data: &[u8], password: &str) -> Result<Option<Vec<u8>
         .ok_or("malformed PKCS#12: PBKDF2 iteration count is 0")?;
     let mut key_length = None;
     let mut prf = pbkdf2::PBKDF2_HMAC_SHA1;
+    let mut hmac_sha256 = false;
     for &t in &kp[2..] {
         match t.tag {
             0x02 => key_length = Some(uint(t, "PBKDF2 key length")? as usize),
@@ -243,6 +260,7 @@ fn pbes2_decrypt(alg: Tlv, data: &[u8], password: &str) -> Result<Option<Vec<u8>
                 let p = children(t.body)?;
                 let oid = child(&p, 0, 0x06, "PBKDF2 PRF")?.body;
                 let sub = if oid.len() == OID_HMAC_PREFIX.len() + 1 && oid.starts_with(OID_HMAC_PREFIX) { oid[OID_HMAC_PREFIX.len()] } else { 0 };
+                hmac_sha256 = sub == 9;
                 prf = match sub {
                     7 => pbkdf2::PBKDF2_HMAC_SHA1,
                     9 => pbkdf2::PBKDF2_HMAC_SHA256,
@@ -270,7 +288,12 @@ fn pbes2_decrypt(alg: Tlv, data: &[u8], password: &str) -> Result<Option<Vec<u8>
         return Err("malformed PKCS#12: ciphertext is not a whole number of AES blocks".into());
     }
     let mut key = vec![0u8; key_len];
-    pbkdf2::derive(prf, iterations, salt, password.as_bytes(), &mut key);
+    match ShaNi::detect().filter(|_| hmac_sha256) {
+        // keytool's and OpenSSL's default PRF: two compressions per iteration on SHA-NI, about
+        // twice as fast as going through ring's HMAC for every iteration.
+        Some(ni) => ni.pbkdf2_hmac_sha256(password.as_bytes(), salt, iterations.get(), &mut key),
+        None => pbkdf2::derive(prf, iterations, salt, password.as_bytes(), &mut key),
+    }
     let mut plain = data.to_vec();
     cbc_decrypt(&key, iv, &mut plain)?;
     let pad = *plain.last().unwrap() as usize;
@@ -347,6 +370,43 @@ fn parse_safe_contents(b: &[u8], bags: &mut Bags, depth: u32) -> Result<(), Stri
     Ok(())
 }
 
+/// One ContentInfo of the AuthenticatedSafe: SafeContents in the clear, or still encrypted.
+enum Part<'a> {
+    Plain(Bags),
+    Encrypted(Tlv<'a>, Vec<u8>),
+}
+
+/// Walk the AuthenticatedSafe without deriving any key: plaintext SafeContents are parsed,
+/// encrypted ones kept (with their algorithm) for `pbes2_decrypt`.
+fn safe_contents(auth_safe: &[u8]) -> Result<Vec<Part<'_>>, String> {
+    let mut parts = Vec::new();
+    for ci in children(one(auth_safe, 0x30, "AuthenticatedSafe")?.body)? {
+        let (oid, content) = content_info(ci)?;
+        if oid == OID_DATA {
+            let mut bags = Bags::default();
+            parse_safe_contents(&octets(expect_tag(content, content.tag & 0x20 | 0x04, "data")?)?, &mut bags, 0)?;
+            parts.push(Part::Plain(bags));
+        } else if oid == OID_ENCRYPTED_DATA {
+            // EncryptedData ::= SEQUENCE { version, EncryptedContentInfo { type, alg, [0] IMPLICIT data } }
+            let ed = children(expect_tag(content, 0x30, "EncryptedData")?.body)?;
+            let eci = children(child(&ed, 1, 0x30, "EncryptedContentInfo")?.body)?;
+            let alg = child(&eci, 1, 0x30, "EncryptedContentInfo")?;
+            let Some(&enc) = eci.get(2) else { continue };
+            if enc.tag & !0x20 != 0x80 {
+                return Err("malformed PKCS#12 EncryptedContentInfo".into());
+            }
+            parts.push(Part::Encrypted(alg, octets(enc)?));
+        } else {
+            return Err("PKCS#12 public-key privacy mode (envelopedData) is not supported".into());
+        }
+    }
+    Ok(parts)
+}
+
+fn join<T>(h: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    h.join().expect("PKCS#12 key derivation panicked")
+}
+
 /// Leaf-first certificate chain, following issuer → subject like `PKCS12KeyStore`.
 fn build_chain(certs: &[CertBag], leaf: usize) -> Result<Vec<Vec<u8>>, String> {
     let names: Vec<(&[u8], &[u8])> = certs.iter().map(|c| cert_issuer_subject(&c.der)).collect::<Result<_, _>>()?;
@@ -364,8 +424,12 @@ fn build_chain(certs: &[CertBag], leaf: usize) -> Result<Vec<Vec<u8>>, String> {
     Ok(used.into_iter().map(|i| certs[i].der.clone()).collect())
 }
 
-/// Parse a PKCS#12 file, verifying its MAC (when present) with the store password.
-pub fn parse(bytes: &[u8], store_password: &str) -> Result<Pkcs12, String> {
+/// Parse a PKCS#12 file, verifying its MAC (when present) with the store password. With `key`,
+/// the shrouded keys that request can select are decrypted too (`KeyEntry::recovered`).
+///
+/// keytool's defaults give the MAC, the encrypted certificates and every key their own 10 000
+/// iteration key derivation, ~0.5 ms each; they are independent, so they run side by side.
+pub fn parse(bytes: &[u8], store_password: &str, key: Option<KeyRequest>) -> Result<Pkcs12, String> {
     let pfx = one(bytes, 0x30, "PFX")?;
     if pfx.raw.len() != bytes.len() {
         return Err("malformed PKCS#12: trailing data after the PFX".into());
@@ -379,30 +443,56 @@ pub fn parse(bytes: &[u8], store_password: &str) -> Result<Pkcs12, String> {
         return Err("PKCS#12 files with public-key integrity (signed authSafe) are not supported".into());
     }
     let auth_safe = octets(expect_tag(content, content.tag & 0x20 | 0x04, "authSafe")?)?;
-    if let Some(&mac) = f.get(2) {
-        verify_mac(expect_tag(mac, 0x30, "MacData")?, &auth_safe, store_password)?;
-    }
+    let mac = f.get(2).map(|&m| expect_tag(m, 0x30, "MacData")).transpose()?;
 
+    let auth_safe = &auth_safe;
+    let (parts, decrypted, recovered) = std::thread::scope(|s| {
+        // The MAC covers everything below, so it starts first and its verdict comes first: a
+        // wrong store password or a tampered file is an integrity failure, whatever else it breaks.
+        let mac = mac.map(|m| s.spawn(move || verify_mac(m, auth_safe, store_password)));
+        let mac_ok = || mac.map_or(Ok(()), join);
+        let parts = match safe_contents(auth_safe) {
+            Ok(p) => p,
+            Err(e) => return mac_ok().and(Err(e)),
+        };
+        // Then every other key derivation at once: each encrypted SafeContents, and the plaintext
+        // shrouded keys the request can select.
+        let (decrypted, recovered) = std::thread::scope(|s| {
+            let containers: Vec<_> = parts
+                .iter()
+                .filter_map(|p| if let Part::Encrypted(alg, data) = p { Some(s.spawn(move || pbes2_decrypt(*alg, data, store_password))) } else { None })
+                .collect();
+            let wanted = parts.iter().filter_map(|p| if let Part::Plain(b) = p { Some(&b.keys) } else { None }).flatten();
+            let keys: Vec<_> = match key {
+                Some(k) => wanted
+                    .filter(|kb| k.alias.map_or(true, |a| kb.name.as_ref().is_some_and(|n| n.to_lowercase() == a.to_lowercase())))
+                    .map(|kb| (kb.der.clone(), s.spawn(move || recover_key(&kb.der, k.password))))
+                    .collect(),
+                None => Vec::new(),
+            };
+            let decrypted: Vec<_> = containers.into_iter().map(join).collect();
+            let recovered: Vec<(Vec<u8>, Result<Vec<u8>, String>)> = keys.into_iter().map(|(der, h)| (der, join(h))).collect();
+            (decrypted, recovered)
+        });
+        mac_ok()?;
+        Ok((parts, decrypted, recovered))
+    })?;
+
+    // Bags in document order, as a sequential reader would have collected them.
     let mut bags = Bags::default();
-    for ci in children(one(&auth_safe, 0x30, "AuthenticatedSafe")?.body)? {
-        let (oid, content) = content_info(ci)?;
-        if oid == OID_DATA {
-            parse_safe_contents(&octets(expect_tag(content, content.tag & 0x20 | 0x04, "data")?)?, &mut bags, 0)?;
-        } else if oid == OID_ENCRYPTED_DATA {
-            // EncryptedData ::= SEQUENCE { version, EncryptedContentInfo { type, alg, [0] IMPLICIT data } }
-            let ed = children(expect_tag(content, 0x30, "EncryptedData")?.body)?;
-            let eci = children(child(&ed, 1, 0x30, "EncryptedContentInfo")?.body)?;
-            let alg = child(&eci, 1, 0x30, "EncryptedContentInfo")?;
-            let Some(&enc) = eci.get(2) else { continue };
-            if enc.tag & !0x20 != 0x80 {
-                return Err("malformed PKCS#12 EncryptedContentInfo".into());
+    let mut decrypted = decrypted.into_iter();
+    for part in parts {
+        let more = match part {
+            Part::Plain(b) => b,
+            Part::Encrypted(..) => {
+                let text = decrypted.next().expect("one result per container")?.ok_or("cannot decrypt the keystore's certificates: wrong keystore password?")?;
+                let mut b = Bags::default();
+                parse_safe_contents(&text, &mut b, 0)?;
+                b
             }
-            let plain = pbes2_decrypt(alg, &octets(enc)?, store_password)?
-                .ok_or("cannot decrypt the keystore's certificates: wrong keystore password?")?;
-            parse_safe_contents(&plain, &mut bags, 0)?;
-        } else {
-            return Err("PKCS#12 public-key privacy mode (envelopedData) is not supported".into());
-        }
+        };
+        bags.keys.extend(more.keys);
+        bags.certs.extend(more.certs);
     }
 
     let single_key = bags.keys.len() == 1;
@@ -432,7 +522,8 @@ pub fn parse(bytes: &[u8], store_password: &str) -> Result<Pkcs12, String> {
                 unnamed.to_string()
             }
         };
-        keys.push(KeyEntry { alias, protected_key: k.der.clone(), chain });
+        let recovered = recovered.iter().find(|(der, _)| *der == k.der).map(|(_, r)| r.clone());
+        keys.push(KeyEntry { alias, protected_key: k.der.clone(), chain, recovered });
     }
     Ok(Pkcs12 { keys })
 }
@@ -492,7 +583,7 @@ mod tests {
 
     fn check_store(path: &str, pw: &str, aliases: &[&str]) -> Option<Pkcs12> {
         let b = load(path)?;
-        let ks = parse(&b, pw).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let ks = parse(&b, pw, None).unwrap_or_else(|e| panic!("{path}: {e}"));
         let mut got: Vec<_> = ks.keys.iter().map(|k| k.alias.as_str()).collect();
         got.sort();
         assert_eq!(got, aliases, "{path}");
@@ -502,10 +593,20 @@ mod tests {
             assert_eq!(one(&pkcs8, 0x30, "").unwrap().raw.len(), pkcs8.len());
             assert!(recover_key(&k.protected_key, "wrong").unwrap_err().contains("wrong key password"));
         }
-        assert!(parse(&b, "wrong").err().unwrap().contains("integrity"), "{path}");
+        assert!(parse(&b, "wrong", None).err().unwrap().contains("integrity"), "{path}");
         for cut in [0usize, 1, 4, 40, b.len() / 2, b.len() - 1] {
-            assert!(parse(&b[..cut], pw).is_err(), "{path} cut at {cut}");
+            assert!(parse(&b[..cut], pw, None).is_err(), "{path} cut at {cut}");
         }
+        // Keys decrypted alongside the store's own derivations match a separate recovery.
+        let eager = parse(&b, pw, Some(KeyRequest { alias: None, password: pw })).unwrap();
+        for (k, e) in ks.keys.iter().zip(&eager.keys) {
+            assert!(k.recovered.is_none());
+            if let Some(r) = &e.recovered {
+                assert_eq!(r.as_ref().unwrap(), &recover_key(&k.protected_key, pw).unwrap(), "{path}: {}", k.alias);
+            }
+        }
+        let wrong = parse(&b, pw, Some(KeyRequest { alias: None, password: "wrong" })).unwrap();
+        assert!(wrong.keys.iter().filter_map(|k| k.recovered.as_ref()).all(|r| r.as_ref().unwrap_err().contains("wrong key password")));
         Some(ks)
     }
 
@@ -532,7 +633,7 @@ mod tests {
     #[test]
     fn chain_is_ordered_regardless_of_storage_order() {
         let Some(b) = load("testdata/chain.p12") else { return };
-        let ks = parse(&b, "android").unwrap();
+        let ks = parse(&b, "android", None).unwrap();
         let (leaf, ca) = (ks.keys[0].chain[0].clone(), ks.keys[0].chain[1].clone());
         let certs = vec![CertBag { der: ca.clone(), local_id: None }, CertBag { der: leaf.clone(), local_id: None }];
         assert_eq!(build_chain(&certs, 1).unwrap(), vec![leaf, ca]);
@@ -541,7 +642,7 @@ mod tests {
     #[test]
     fn legacy_store_is_rejected_by_name() {
         let Some(b) = load("testdata/ossl_legacy.p12") else { return };
-        let e = parse(&b, "android").err().unwrap();
+        let e = parse(&b, "android", None).err().unwrap();
         assert!(e.contains("legacy") && e.contains("RC2"), "{e}");
     }
 }

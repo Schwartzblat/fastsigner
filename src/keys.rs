@@ -51,7 +51,10 @@ impl Signer {
     pub fn load_keystore(ks_path: &Path, store_password: &str, alias: Option<&str>, key_password: &str) -> Result<Signer, String> {
         let bytes = std::fs::read(ks_path).map_err(|e| format!("{}: {e}", ks_path.display()))?;
         let (keys, recover): (_, fn(&[u8], &str) -> Result<Vec<u8>, String>) = match crate::jks::detect(&bytes) {
-            crate::jks::StoreKind::Pkcs12 => (crate::pkcs12::parse(&bytes, store_password).map(|s| s.keys), crate::pkcs12::recover_key),
+            crate::jks::StoreKind::Pkcs12 => {
+                let request = crate::pkcs12::KeyRequest { alias, password: key_password };
+                (crate::pkcs12::parse(&bytes, store_password, Some(request)).map(|s| s.keys), crate::pkcs12::recover_key)
+            }
             _ => (crate::jks::parse(&bytes, store_password).map(|s| s.keys), crate::jks::recover_key),
         };
         let keys = keys.map_err(|e| format!("{}: {e}", ks_path.display()))?;
@@ -69,8 +72,11 @@ impl Signer {
                 n => return Err(format!("{}: keystore has {n} key entries, --ks-key-alias is required (available: {})", ks_path.display(), available())),
             },
         };
-        let pkcs8 = recover(&entry.protected_key, key_password)
-            .map_err(|e| format!("{}: alias {:?}: {e}", ks_path.display(), entry.alias))?;
+        let pkcs8 = match &entry.recovered {
+            Some(r) => r.clone(),
+            None => recover(&entry.protected_key, key_password),
+        }
+        .map_err(|e| format!("{}: alias {:?}: {e}", ks_path.display(), entry.alias))?;
         if entry.chain.is_empty() {
             return Err(format!("{}: alias {:?} has no certificate chain", ks_path.display(), entry.alias));
         }

@@ -1,6 +1,7 @@
 //! ZIP structure discovery: End of Central Directory, Central Directory, and the
 //! APK Signing Block. Only the pieces a v2/v3 signer needs; entry contents are never parsed.
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::io;
 
@@ -203,7 +204,9 @@ impl CdEntry {
 }
 
 pub fn parse_cd_entries(cd: &[u8]) -> Result<Vec<CdEntry>, String> {
-    let mut out = Vec::new();
+    // Records are at least 46 bytes. Reserving for that many avoids regrowing (and re-faulting)
+    // a ~1 MB vector for a big APK; pages that are never written are never touched.
+    let mut out = Vec::with_capacity(cd.len() / 46);
     let mut p = 0usize;
     while p < cd.len() {
         if p + 46 > cd.len() || cd[p..p + 4] != CD_ENTRY_SIG {
@@ -264,37 +267,45 @@ pub fn entry_policy(name: &[u8]) -> EntryPolicy {
     }
 }
 
-pub struct FilteredCd {
-    /// Central Directory holding only `Output` entries.
-    pub bytes: Vec<u8>,
-    pub entries: u64,
+pub struct FilteredCd<'a> {
+    /// Central Directory holding only `Output` entries; borrowed when nothing was dropped.
+    pub bytes: Cow<'a, [u8]>,
+    /// The records of `bytes`, with ranges into `bytes`.
+    pub kept: Vec<CdEntry>,
     pub removed: Vec<String>,
-    /// Every record of the original Central Directory, with its policy.
-    pub all: Vec<CdEntry>,
-    pub policies: Vec<EntryPolicy>,
 }
 
 /// Apply `entry_policy` to a Central Directory. The local file data of dropped entries is
 /// left in place (orphaned) unless the entries section is rewritten for alignment — readers
 /// only follow the Central Directory, and apksigner leaves such orphans too.
-pub fn filter_cd(cd: &[u8]) -> Result<FilteredCd, String> {
-    let all = parse_cd_entries(cd)?;
+pub fn filter_cd(cd: &[u8]) -> Result<FilteredCd<'_>, String> {
+    let (mut kept, policies) = classify(cd)?;
+    if policies.iter().all(|&p| p == EntryPolicy::Output) {
+        return Ok(FilteredCd { bytes: Cow::Borrowed(cd), kept, removed: Vec::new() });
+    }
     let mut out = Vec::with_capacity(cd.len());
     let mut removed = Vec::new();
-    let mut entries = 0u64;
-    let mut policies = Vec::with_capacity(all.len());
-    for e in &all {
-        let name = e.name(cd);
-        let policy = entry_policy(name);
-        policies.push(policy);
+    let mut n = 0;
+    for (i, policy) in policies.into_iter().enumerate() {
+        let e = kept[i].clone();
         if policy == EntryPolicy::Output {
+            let shift = e.record.start - out.len();
             out.extend_from_slice(&cd[e.record.clone()]);
-            entries += 1;
+            kept[n] = CdEntry { record: e.record.start - shift..e.record.end - shift, name: e.name.start - shift..e.name.end - shift, ..e };
+            n += 1;
         } else {
-            removed.push(String::from_utf8_lossy(name).into_owned());
+            removed.push(String::from_utf8_lossy(e.name(cd)).into_owned());
         }
     }
-    Ok(FilteredCd { bytes: out, entries, removed, all, policies })
+    kept.truncate(n);
+    Ok(FilteredCd { bytes: Cow::Owned(out), kept, removed })
+}
+
+/// Every record of a Central Directory, with its `entry_policy`.
+pub fn classify(cd: &[u8]) -> Result<(Vec<CdEntry>, Vec<EntryPolicy>), String> {
+    let all = parse_cd_entries(cd)?;
+    let policies = all.iter().map(|e| entry_policy(e.name(cd))).collect();
+    Ok((all, policies))
 }
 
 #[cfg(test)]
@@ -449,14 +460,23 @@ pub(crate) mod tests {
         let s = parse(z.as_slice()).unwrap();
         let cd = &z[s.cd_off as usize..(s.cd_off + s.cd_size) as usize];
         let f = filter_cd(cd).unwrap();
-        assert_eq!(f.entries, 2);
+        assert_eq!(f.kept.len(), 2);
         assert_eq!(f.removed, vec!["META-INF/MANIFEST.MF", "META-INF/CERT.SF", "META-INF/CERT.RSA", "res/", "stamp-cert-sha256"]);
-        assert_eq!(f.all.len(), 7);
-        assert_eq!(f.policies, [EntryPolicy::Output, EntryPolicy::Skip, EntryPolicy::Skip, EntryPolicy::Skip, EntryPolicy::Skip, EntryPolicy::Gap, EntryPolicy::Output]);
-        // The filtered CD must itself parse cleanly and keep the survivors in order.
+        let (all, policies) = classify(cd).unwrap();
+        assert_eq!(all.len(), 7);
+        assert_eq!(policies, [EntryPolicy::Output, EntryPolicy::Skip, EntryPolicy::Skip, EntryPolicy::Skip, EntryPolicy::Skip, EntryPolicy::Gap, EntryPolicy::Output]);
+        // The filtered CD must itself parse cleanly and keep the survivors in order; with
+        // nothing left to drop it is borrowed, not copied.
         let g = filter_cd(&f.bytes).unwrap();
-        assert_eq!(g.entries, 2);
+        assert_eq!(g.kept.len(), 2);
         assert!(g.removed.is_empty());
         assert_eq!(g.bytes, f.bytes);
+        assert!(matches!(g.bytes, Cow::Borrowed(_)));
+        // `kept` indexes the filtered directory exactly as a fresh parse of it would.
+        let reparsed = parse_cd_entries(&f.bytes).unwrap();
+        for (a, b) in f.kept.iter().zip(&reparsed) {
+            assert_eq!((&a.record, &a.name, a.lfh_off, a.method, a.flags, a.compressed_size), (&b.record, &b.name, b.lfh_off, b.method, b.flags, b.compressed_size));
+        }
+        assert_eq!(f.kept[1].name(&f.bytes), b"res/x");
     }
 }

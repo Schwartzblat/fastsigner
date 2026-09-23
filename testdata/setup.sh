@@ -50,6 +50,10 @@ if [ ! -f chain.p12 ]; then  # CA-signed leaf; CA cert stored before the leaf to
   rm -f leaf.csr ca.cert.srl chain.pem
 fi
 [ -f ossl_legacy.p12 ] || openssl pkcs12 -export -legacy -inkey rsa.key.pem -in rsa.cert.pem -name old -passout pass:android -out ossl_legacy.p12 2>/dev/null || true
+if [ ! -f rsa4096.p12 ]; then  # RSA above 3072 bits: apksig switches the content digest to SHA-512
+  openssl req -new -x509 -newkey rsa:4096 -nodes -keyout rsa4096.key.pem -days 3650 -subj "/CN=fastsigner test RSA-4096" -out rsa4096.cert.pem 2>/dev/null
+  openssl pkcs12 -export -inkey rsa4096.key.pem -in rsa4096.cert.pem -name big -passout pass:android -out rsa4096.p12
+fi
 python3 - <<'PY'
 import zipfile
 man = zipfile.ZipFile('small.apk').read('AndroidManifest.xml')
@@ -63,6 +67,7 @@ $AS sign --ks rsa.jks --ks-pass pass:android --ks-key-alias test --v1-signing-en
 $AS sign --ks rsa.p12 --ks-pass pass:android --v1-signing-enabled false --out ref_small_p12.apk small.apk
 $AS sign --ks ossl.p12 --ks-pass pass:android --v1-signing-enabled false --out ref_small_ossl_p12.apk small.apk
 $AS sign --ks chain.p12 --ks-pass pass:android --v1-signing-enabled false --out ref_small_chain_p12.apk small.apk
+$AS sign --ks rsa4096.p12 --ks-pass pass:android --v1-signing-enabled false --out ref_small_rsa4096_p12.apk small.apk
 # Unaligned copies (Python's zipfile writes no alignment padding) + apksigner's output for them:
 # the zipalign rewrite path must reproduce apksigner byte for byte.
 python3 - <<'PY'

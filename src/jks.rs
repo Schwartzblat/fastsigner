@@ -48,6 +48,9 @@ pub struct KeyEntry {
     /// EncryptedPrivateKeyInfo DER, see `recover_key`.
     pub protected_key: Vec<u8>,
     pub chain: Vec<Vec<u8>>,
+    /// `recover_key`'s result when the reader already ran it (the PKCS#12 reader decrypts the
+    /// keys a request can select alongside its other key derivations).
+    pub recovered: Option<Result<Vec<u8>, String>>,
 }
 
 pub struct Jks {
@@ -126,7 +129,7 @@ pub fn parse(bytes: &[u8], store_password: &str) -> Result<Jks, String> {
                     let n = c.u32()? as usize;
                     chain.push(c.take(n)?.to_vec());
                 }
-                keys.push(KeyEntry { alias, protected_key, chain });
+                keys.push(KeyEntry { alias, protected_key, chain, recovered: None });
             }
             2 => {
                 if version == 2 {

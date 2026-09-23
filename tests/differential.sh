@@ -42,10 +42,16 @@ echo "== PKCS#12 keystores =="
 cp -f ref_small_p12.apk t_p1.apk && $FS sign --ks rsa.p12 --ks-pass pass:android t_p1.apk && cmp -s ref_small_p12.apk t_p1.apk && ok "PKCS#12 (keytool) RSA identical to apksigner --ks output" || bad "PKCS#12 keytool RSA identical"
 cp -f ref_small_ossl_p12.apk t_p2.apk && $FS sign --ks ossl.p12 --ks-pass pass:android --ks-type PKCS12 t_p2.apk && cmp -s ref_small_ossl_p12.apk t_p2.apk && ok "PKCS#12 (openssl) RSA identical to apksigner --ks output" || bad "PKCS#12 openssl RSA identical"
 cp -f ref_small_chain_p12.apk t_p3.apk && $FS sign --ks chain.p12 --ks-pass pass:android t_p3.apk && cmp -s ref_small_chain_p12.apk t_p3.apk && ok "PKCS#12 CA chain identical to apksigner --ks output" || bad "PKCS#12 chain identical"
+if [ -e ref_small_rsa4096_p12.apk ]; then
+  cp -f ref_small_rsa4096_p12.apk t_p7.apk && $FS sign --ks rsa4096.p12 --ks-pass pass:android t_p7.apk && cmp -s ref_small_rsa4096_p12.apk t_p7.apk && ok "PKCS#12 RSA-4096 (SHA-512 digest, redone once the key is loaded) identical to apksigner" || bad "PKCS#12 RSA-4096 identical"
+else
+  echo "  SKIP  PKCS#12 RSA-4096 (rerun testdata/setup.sh)"
+fi
 $FS sign --ks ec.p12 --ks-pass pass:android --ks-key-alias ECKEY --out t_p4.apk small.apk && verify t_p4.apk && ok "PKCS#12 EC key" || bad "PKCS#12 EC"
 $FS sign --ks two.p12 --ks-pass pass:storepw --ks-key-alias b --out t_p5.apk small.apk && verify t_p5.apk && ok "PKCS#12 two keys, alias b" || bad "PKCS#12 two.p12"
 $FS sign --ks ossl_aes128_sha1mac.p12 --ks-pass pass:android --out t_p6.apk small.apk && verify t_p6.apk && ok "PKCS#12 AES-128, SHA-1 MAC, plain cert bag" || bad "PKCS#12 aes128"
 $FS sign --ks rsa.p12 --ks-pass pass:wrong --out t_x.apk small.apk 2>/dev/null && bad "PKCS#12 wrong password refused" || ok "PKCS#12 wrong password refused"
+[ ! -e t_x.apk ] && [ ! -e .t_x.apk.fastsigner-tmp ] && ok "failed --out leaves no output or temp file behind" || bad "failed --out leaves no output or temp file behind"
 $FS sign --ks ossl_legacy.p12 --ks-pass pass:android --out t_x.apk small.apk 2>&1 | grep -q "legacy PKCS#12 encryption" && ok "legacy (RC2/3DES) PKCS#12 refused with a hint" || bad "legacy PKCS#12 message"
 
 echo "== batch mode =="
