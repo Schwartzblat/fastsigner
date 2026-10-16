@@ -3,3 +3,6 @@
 # binary no longer depends on the host's glibc version. It roughly doubles the binary (1 → 2 MB).
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]

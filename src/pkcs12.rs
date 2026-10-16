@@ -18,7 +18,7 @@ use std::num::NonZeroU32;
 
 use crate::jks::KeyEntry;
 use crate::keys::{cert_issuer_subject, der_header};
-use crate::sha256::ShaNi;
+use crate::sha256::ShaExt;
 
 const OID_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
 const OID_ENCRYPTED_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x06];
@@ -133,8 +133,8 @@ fn pkcs12_kdf(alg: &'static digest::Algorithm, pass: &[u8], salt: &[u8], id: u8,
         ctx.update(&d);
         ctx.update(&i_buf);
         let first = ctx.finish();
-        let a: Vec<u8> = match ShaNi::detect().filter(|_| *alg == digest::SHA256) {
-            Some(ni) => ni.iterate(first.as_ref().try_into().expect("SHA-256 output"), iterations - 1).to_vec(),
+        let a: Vec<u8> = match ShaExt::detect().filter(|_| *alg == digest::SHA256) {
+            Some(ext) => ext.iterate(first.as_ref().try_into().expect("SHA-256 output"), iterations - 1).to_vec(),
             None => {
                 let mut a = first;
                 for _ in 1..iterations {
@@ -288,10 +288,10 @@ fn pbes2_decrypt(alg: Tlv, data: &[u8], password: &str) -> Result<Option<Vec<u8>
         return Err("malformed PKCS#12: ciphertext is not a whole number of AES blocks".into());
     }
     let mut key = vec![0u8; key_len];
-    match ShaNi::detect().filter(|_| hmac_sha256) {
-        // keytool's and OpenSSL's default PRF: two compressions per iteration on SHA-NI, about
-        // twice as fast as going through ring's HMAC for every iteration.
-        Some(ni) => ni.pbkdf2_hmac_sha256(password.as_bytes(), salt, iterations.get(), &mut key),
+    match ShaExt::detect().filter(|_| hmac_sha256) {
+        // keytool's and OpenSSL's default PRF: two compressions per iteration on the SHA
+        // instructions, about twice as fast as going through ring's HMAC for every iteration.
+        Some(ext) => ext.pbkdf2_hmac_sha256(password.as_bytes(), salt, iterations.get(), &mut key),
         None => pbkdf2::derive(prf, iterations, salt, password.as_bytes(), &mut key),
     }
     let mut plain = data.to_vec();

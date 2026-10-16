@@ -9,14 +9,39 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
+      # On real hardware of each architecture, so the SHA-256 kernels are checked before shipping.
+      - run: cargo test --release --locked
+
       - run: cargo build --release --locked
+
+      - run: mv target/release/fastsigner fastsigner-${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastsigner-${{ matrix.arch }}
+          path: fastsigner-${{ matrix.arch }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" target/release/fastsigner --title "${{ github.ref_name }}" --generate-notes --repo "${{ github.repository }}"
+        run: gh release create "${{ github.ref_name }}" fastsigner-x86_64 fastsigner-aarch64 --title "${{ github.ref_name }}" --generate-notes --repo "${{ github.repository }}"

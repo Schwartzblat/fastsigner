@@ -130,11 +130,22 @@ tests/corpus_identity.sh       # unaligned rebuild of every local APK: fastsigne
 bench/bench_fastsigner.sh      # the table above
 ```
 
+Linux on x86-64 and arm64 (AArch64) is supported; releases carry a static binary for each
+(`fastsigner-x86_64`, `fastsigner-aarch64`). To cross-build the arm64 one on an x86-64 Debian or
+Ubuntu host (`gcc-aarch64-linux-gnu` package), and run its tests under `qemu-aarch64`:
+
+```
+rustup target add aarch64-unknown-linux-gnu
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+cargo build --release --target aarch64-unknown-linux-gnu
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER=qemu-aarch64 cargo test --release --target aarch64-unknown-linux-gnu
+```
+
 ## Third-party dependencies
 
 | crate | purpose | why this one |
 |---|---|---|
-| [`ring`](https://crates.io/crates/ring) 0.17 | SHA-256/512, SHA-1 (JKS, PKCS#12 MAC), HMAC, PBKDF2, RSA PKCS#1 v1.5, ECDSA P-256, PKCS#8 parsing, RNG | one crate covers all crypto; BoringSSL assembly with SHA-NI; no system library. Needs a C compiler at build time. |
+| [`ring`](https://crates.io/crates/ring) 0.17 | SHA-256/512, SHA-1 (JKS, PKCS#12 MAC), HMAC, PBKDF2, RSA PKCS#1 v1.5, ECDSA P-256, PKCS#8 parsing, RNG | one crate covers all crypto; BoringSSL assembly with SHA-NI and the ARMv8 SHA instructions; no system library. Needs a C compiler at build time. |
 | [`aes`](https://crates.io/crates/aes) 0.9 | AES block cipher for PKCS#12 key/cert decryption | `ring` has no raw AES or CBC mode. RustCrypto's crate is pure Rust and constant-time (AES-NI when available). Pulls in `cipher`, `crypto-common`, `hybrid-array`, `typenum`, `inout`, `cpufeatures`, `cpubits`. |
 | [`cbc`](https://crates.io/crates/cbc) 0.2 | CBC mode on top of `aes` | built with `default-features = false`, which drops `block-padding`: PKCS#7 unpadding is checked by hand. Hand-writing AES was considered and rejected, because it would be security-sensitive code to maintain for a once-per-run operation. |
 
@@ -142,12 +153,13 @@ Everything else is hand-written on `std`: CLI parsing, base64/PEM, a minimal DER
 the SubjectPublicKeyInfo out of the certificate and the scalar out of EC keys), the JKS reader and
 key protector, the PKCS#12 container parser and its RFC 7292 KDF, ZIP/EOCD/central-directory handling, the scoped-thread work pools (chunks within an
 APK, APKs within a batch), and physical-core detection. So is SHA-256 on the x86 SHA extensions
-(`src/sha256.rs`, ~300 lines of `core::arch` intrinsics plus tests): ring's is as fast for one message, but
-the digest and the PKCS#12 key derivations need two messages interleaved per core and fixed-size
-iteration loops, which ring's API cannot express. It is checked against ring in the unit tests,
-and ring remains the fallback for CPUs without SHA-NI and for SHA-512. The input is mapped with
-`mmap`/`madvise` called directly (`src/mmap.rs`). `memmap2`, `rayon` and `clap` were considered
-and deliberately left out.
+and the ARMv8 SHA2 instructions (`src/sha256.rs`, ~400 lines of `core::arch` intrinsics, a few
+inline `asm!` round pairs on arm64, and tests): ring's is as fast for one message, but the digest
+and the PKCS#12 key derivations need two messages interleaved per core and fixed-size iteration
+loops, which ring's API cannot express. It is checked against ring in the unit tests, and ring
+remains the fallback for CPUs without these instructions and for SHA-512. The input is mapped
+with `mmap`/`madvise` called directly (`src/mmap.rs`). `memmap2`, `rayon` and `clap` were
+considered and deliberately left out.
 
 ## Not implemented (yet)
 
@@ -163,8 +175,8 @@ and deliberately left out.
 | path | role |
 |---|---|
 | `src/zip.rs` | EOCD / central directory / existing signing block discovery, entry policy (what apksigner keeps, drops, or leaves as a gap) |
-| `src/digest.rs` | parallel 1 MiB chunked content digest (two chunks per thread on SHA-NI), physical-core count |
-| `src/sha256.rs` | SHA-256 on the SHA extensions: 1- and 2-way block functions, PBKDF2-HMAC-SHA256 |
+| `src/digest.rs` | parallel 1 MiB chunked content digest (two chunks per thread on the SHA instructions), physical-core count |
+| `src/sha256.rs` | SHA-256 on the SHA instructions (x86 SHA-NI, ARMv8 SHA2): 1- and 2-way block functions, PBKDF2-HMAC-SHA256 |
 | `src/mmap.rs` | read-only file mapping; pages are unmapped by the digest threads as they finish |
 | `src/align.rs` | zipalign check (piggybacks on the digest pass) and apksig-identical entries rewrite |
 | `src/keys.rs` | PEM/DER key + cert loading, keystore entry selection, SPKI extraction, sign-then-verify |

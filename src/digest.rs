@@ -5,15 +5,15 @@
 //!   top digest   = H(0x5a || u32le(chunk_count) || chunk digests...)
 //!
 //! The chunks are read straight out of the mapped APK. With SHA-256 (every key except RSA above
-//! 3072 bits) and SHA-NI, each worker keeps two chunks in flight and feeds them to the core's SHA
-//! unit together, refilling a lane as soon as its chunk ends; otherwise ring hashes one chunk at a
-//! time.
+//! 3072 bits) and a CPU with SHA instructions (SHA-NI, ARMv8 SHA2), each worker keeps two chunks in
+//! flight and feeds them to the core's SHA unit together, refilling a lane as soon as its chunk
+//! ends; otherwise ring hashes one chunk at a time.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ring::digest::{Algorithm, Context, SHA256};
 
-use crate::sha256::{self, Sha256, ShaNi};
+use crate::sha256::{self, Sha256, ShaExt};
 
 pub const CHUNK_SIZE: u64 = 1 << 20;
 
@@ -89,7 +89,7 @@ pub fn top_digest(alg: &'static Algorithm, count: usize, parts: &[&[u8]]) -> Vec
 /// A claimed chunk: global index, its bytes, and the file-backed part of them (for `release`).
 type Claimed<'a> = (usize, [&'a [u8]; 2], &'a [u8]);
 
-/// A chunk being hashed on SHA-NI: the hasher and the bytes it has not absorbed yet.
+/// A chunk being hashed on the SHA instructions: the hasher and the bytes it has not absorbed yet.
 struct Lane<'a> {
     k: usize,
     h: Sha256,
@@ -98,8 +98,8 @@ struct Lane<'a> {
 }
 
 impl<'a> Lane<'a> {
-    fn new(ni: ShaNi, (k, parts, file_part): Claimed<'a>) -> Self {
-        let mut h = Sha256::new(ni);
+    fn new(ext: ShaExt, (k, parts, file_part): Claimed<'a>) -> Self {
+        let mut h = Sha256::new(ext);
         let mut prefix = [0xa5u8, 0, 0, 0, 0];
         prefix[1..].copy_from_slice(&((parts[0].len() + parts[1].len()) as u32).to_le_bytes());
         h.update(&prefix);
@@ -188,7 +188,7 @@ pub fn content_digest(sources: &[Source], alg: &'static Algorithm, threads: &dyn
     let total_len: u64 = sources.iter().map(|s| s.len()).sum();
     let useful = (total_len.div_ceil(512 << 10) as usize).min(total).max(1);
     let threads = if useful > 1 { threads().clamp(1, useful) } else { 1 };
-    let ni = if *alg == SHA256 { ShaNi::detect() } else { None };
+    let ext = if *alg == SHA256 { ShaExt::detect() } else { None };
 
     let worker = || -> Vec<(usize, [u8; 64])> {
         let mut out = Vec::new();
@@ -197,7 +197,7 @@ pub fn content_digest(sources: &[Source], alg: &'static Algorithm, threads: &dyn
             a[..d.len()].copy_from_slice(d);
             out.push((k, a));
         };
-        let Some(ni) = ni else {
+        let Some(ext) = ext else {
             while let Some((k, parts, file_part)) = claim() {
                 record(k, hash_chunk(alg, &parts).as_ref());
                 release(file_part);
@@ -215,7 +215,7 @@ pub fn content_digest(sources: &[Source], alg: &'static Algorithm, threads: &dyn
                             break;
                         }
                         let Some(c) = claim() else { break };
-                        lanes[i] = Some(Lane::new(ni, c));
+                        lanes[i] = Some(Lane::new(ext, c));
                     }
                     let lane = lanes[i].as_mut().unwrap();
                     if lane.settle() > 0 {

@@ -17,12 +17,22 @@ extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: c_long) -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> c_int;
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+    fn sysconf(name: c_int) -> c_long;
 }
 const PROT_READ: c_int = 1;
 const MAP_SHARED: c_int = 1;
 const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 const MADV_DONTNEED: c_int = 4;
-const PAGE: usize = 4096;
+const _SC_PAGESIZE: c_int = 30;
+
+/// The kernel's page size: 4 KiB on x86-64, but 16 or 64 KiB on some arm64 kernels.
+fn page_size() -> usize {
+    // SAFETY: no arguments to get wrong; glibc answers from the auxiliary vector.
+    match unsafe { sysconf(_SC_PAGESIZE) } {
+        n if n > 0 && (n as usize).is_power_of_two() => n as usize,
+        _ => 4096,
+    }
+}
 
 pub struct Mmap {
     ptr: *mut c_void,
@@ -61,14 +71,16 @@ impl Mmap {
     /// needed again. The data stays in the page cache (touching it again just faults it back in),
     /// so this only moves page-table teardown from one `munmap` at the end — ~0.5 ms for a 145 MB
     /// APK on ext4, 3 ms on tmpfs, whose 4 KiB pages are unmapped one by one — onto the threads
-    /// that read the pages, while they are still running in parallel.
+    /// that read the pages, while they are still running in parallel. Only pages that lie wholly
+    /// inside `part` are released.
     pub fn release(&self, part: &[u8]) {
         let (base, start) = (self.ptr as usize, part.as_ptr() as usize);
         assert!(start >= base && start + part.len() <= base + self.len, "release: slice is not part of the mapping");
         if self.copy.is_some() {
             return;
         }
-        let (a, b) = ((start + PAGE - 1) & !(PAGE - 1), (start + part.len()) & !(PAGE - 1));
+        let page = page_size();
+        let (a, b) = ((start + page - 1) & !(page - 1), (start + part.len()) & !(page - 1));
         if b > a {
             // SAFETY: whole pages inside our own read-only shared file mapping; afterwards reads
             // of them fault the same file data back in. An error just leaves the pages mapped.
@@ -101,6 +113,7 @@ mod tests {
 
     #[test]
     fn mapped_and_copied_views_read_the_file() {
+        const PAGE: usize = 65536; // the largest page size in use, so whole pages are released anywhere
         let data: Vec<u8> = (0..3 * PAGE + 123).map(|i| (i * 7 % 251) as u8).collect();
         let path = std::env::temp_dir().join(format!("fastsigner-mmap-test-{}", std::process::id()));
         std::fs::write(&path, &data).unwrap();
@@ -127,6 +140,6 @@ mod tests {
         std::fs::write(&path, [1u8; 64]).unwrap();
         let m = Mmap::map(&File::open(&path).unwrap()).unwrap();
         std::fs::remove_file(&path).ok();
-        m.release(&vec![0u8; PAGE * 2]);
+        m.release(&vec![0u8; 8192]);
     }
 }
